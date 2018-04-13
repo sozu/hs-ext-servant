@@ -1,0 +1,6 @@
+[submodule "hs-template"]
+	path = hs-template
+	url = https://github.com/sozu/hs-template.git
+[submodule "hs-resource"]
+	path = hs-resource
+	url = https://github.com/sozu/hs-resource.git

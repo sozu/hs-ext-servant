@@ -1,0 +1,4 @@
+.stack-work/
+hs-ext-servant.cabal
+*~
+**/.DS_Store

@@ -15,6 +15,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
 
 module Ext.Servant.Context where
 
@@ -255,6 +256,8 @@ instance ( WrapHandler (Server api) ks rs
         where
             serverD' c p h a b r = wrapHandler (Proxy :: Proxy rs) (Proxy :: Proxy ks) context r <$> serverD c p h a b r
 
+    hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt . s
+
 -- ------------------------------------------------------------
 -- Handler filter combinator
 -- ------------------------------------------------------------
@@ -382,6 +385,7 @@ instance ( FilterHandler f (ServerT api Handler)
          , HasContextEntry context (RequestContextEntry (KeysForFilter f) (ResourcesInContext context))
          , cs ~ (ContextTypes (Refs (ResourcesInContext context)))
          , SelectContexts (Refs (ContextsForFilter f)) (Refs cs) (Refs cs)
+         , Merge (FilterArgs f)
          ) => HasServer (Filter f :> api) context where
     type ServerT (Filter f :> api) m = Apply (FilterArgs f) (ServerT api m)
 
@@ -391,6 +395,32 @@ instance ( FilterHandler f (ServerT api Handler)
                 let filter = getContextEntry context :: f
                 let (RequestContextEntry resources key) = getContextEntry context :: RequestContextEntry (KeysForFilter f) (ResourcesInContext context)
                 serverD c p h a b r >>= \h -> Route (filterHandler filter r key h)
+
+    -- hoistServerWithContext :: Proxy (Filter f :> api) -> Proxy context -> (m x -> n x) -> ServerT (Filter f :> api) m -> ServerT (Filter f :> api) n
+    -- s :: ServerT (Filter f :> api) m
+    --   == Apply (FilterArgs f) (ServerT api m)
+    --   == a1 -> ... -> an -> ServerT api m
+    --
+    -- hoistServerWithContext (Proxy :: Proxy api) pc nt :: ServerT api m -> ServerT api n
+    --
+    -- 結果の型は、
+    -- ServerT (Filter f :> api) n
+    -- でなければならない。
+    -- すなわち、
+    -- Apply (FilterArgs f) (ServerT api n)
+    -- 右辺は、
+    -- (ServerT api m -> ServerT api n) . (Apply (FilterArgs f) (ServerT api m))
+    -- (.) :: (b -> c) -> (a -> b) -> a -> c
+    -- より、
+    -- Apply (FilterArgs f) (ServerT api m) == a -> ServerT api m
+    -- を満たす必要があり、これは推論できない。
+    -- なぜなら、(.)が一つの引数しか取れないから。
+    -- (.*) :: (b -> c) -> (a1 -> .. -> an -> b) -> (a1 -> .. -> an -> c)
+    -- なる関数でつなげば型が一致する。
+    hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt `merge'` s
+        where
+            merge' :: (b -> c) -> Apply (FilterArgs f) b -> Apply (FilterArgs f) c
+            merge' = merge (Proxy :: Proxy (FilterArgs f))
 
 -- ------------------------------------------------------------
 -- Utility type level functions.
@@ -407,3 +437,12 @@ type family ResourcesInContext (context :: [*]) :: [*] where
 type family Apply (as :: [*]) (f :: *) :: *
 type instance Apply '[] f = f
 type instance Apply (a ': as) f = a -> Apply as f
+
+class Merge (as :: [*])  where
+    merge :: forall b c. Proxy as -> (b -> c) -> Apply as b -> Apply as c
+
+instance Merge '[] where
+    merge _ f g = f g
+
+instance (Merge as) => Merge (a ': as) where
+    merge _ f g = \(x :: a) -> (merge (Proxy :: Proxy as) f (g x))

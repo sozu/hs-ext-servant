@@ -1,11 +1,15 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Ext.Servant.Template where
 
 import System.IO.Unsafe
 import Data.IORef
+import Data.Proxy
 import Language.Haskell.TH
 import Language.Haskell.TH.Syntax
 import Language.Haskell.TH.Quote
@@ -93,7 +97,7 @@ declareTemplate n path t statically = do
     mr <- if statically
                 then return $ funD 'mimeRender [clause [wildP, varP $ mkName "it"] (normalB (appE (varE 'UTF8.fromString) (render path))) []]
                 else do
-                    cacheName <- newName $ "cache_" ++ showName n 
+                    cacheName <- newName $ "cache_" ++ nameBase n 
                     -- cache_Name = unsafePerformIO $ newIORef Nothing
                     cache <- funD cacheName [clause [] (normalB (appE (varE 'unsafePerformIO) (appE (varE 'newIORef) (conE 'Nothing)))) []]
                     addTopDecls [cache]
@@ -106,3 +110,16 @@ declareTemplate n path t statically = do
     let ct = funD 'contentType [clause [wildP] (normalB (infixE (bs "text") (varE '(//)) (bs "html"))) []]
     accept <- instanceD (cxt []) (appT (conT ''Accept) (conT n)) [ct]
     return $ [dt, mime, accept]
+
+data HTML
+
+data Renderer = forall t a. (MimeRender t a)
+    => Renderer { renderType :: Proxy t
+                , renderValue :: a
+                }
+
+instance Accept HTML where
+    contentType _ = C8.pack "text" // C8.pack "html"
+
+instance MimeRender HTML Renderer where
+    mimeRender _ (Renderer t v) = mimeRender t v

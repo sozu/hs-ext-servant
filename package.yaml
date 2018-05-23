@@ -29,12 +29,15 @@ dependencies:
 - template-haskell
 - safe-exceptions
 - time
+- text
 - utf8-string
 - bytestring
 - http-media
+- http-api-data
 - servant
 - servant-server
 - wai
+- aeson
 - monad-logger
 - fast-logger
 - vault

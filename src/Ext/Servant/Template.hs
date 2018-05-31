@@ -4,9 +4,12 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
 
 module Ext.Servant.Template where
 
+import GHC.Base
 import System.IO.Unsafe
 import Data.IORef
 import Data.Proxy
@@ -69,6 +72,8 @@ tmpld = QuasiQuoter {
                      in declareTemplate (mkName n) f (unwords t) False
   }
 
+unIO' c = let (# _, v #) = unIO c realWorld# in v
+
 {- | Generate declarations to use a file as an HTML template in Servant.
 
     This function generates type implementing @MimeRender@ for each HTML template.
@@ -94,29 +99,48 @@ declareTemplate n path t statically = do
     dt <- dataD (cxt []) n [] Nothing [] [] -- template-haskell-2.12.0.0
     let imports = thisModule >>= importedModules
     exts <- extsEnabled
-    mr <- if statically
-                then return $ funD 'mimeRender [clause [wildP, varP $ mkName "it"] (normalB (appE (varE 'UTF8.fromString) (render path))) []]
+    (mr, decs) <- if statically
+                then return $ (funD 'mimeRender [clause [wildP, varP $ mkName "it"] (normalB (appE (varE 'UTF8.fromString) (render path))) []], [])
                 else do
-                    cacheName <- newName $ "cache_" ++ nameBase n 
-                    -- cache_Name = unsafePerformIO $ newIORef Nothing
+                    let cacheName = mkName $ "cache_" ++ nameBase n 
                     cache <- funD cacheName [clause [] (normalB (appE (varE 'unsafePerformIO) (appE (varE 'newIORef) (conE 'Nothing)))) []]
-                    addTopDecls [cache]
+                    -- Without NOINLINE pragma,
+                    -- GHC seems to consider that all cache_XXX functions are identical and only an IORef object is created and shared.
+                    -- This causes a bug the expression generated from newest template is always used.
+                    noinline <- pragInlD cacheName NoInline FunLike AllPhases
                     let f = appE (appE (appE [| renderRuntime newContext path |] imports) [| (it, "it", fromJust $ EXP.getType t) |]) (varE cacheName)
-                    return $ funD 'mimeRender [clause [wildP, varP $ mkName "it"]
+                    return $ ( funD 'mimeRender [clause [wildP, varP $ mkName "it"]
                                                       (normalB (appE (varE 'UTF8.fromString) (appE (varE 'unsafePerformIO) f)))
                                                       []]
+                             , [noinline, cache]
+                             )
     mime <- instanceD (cxt []) (appT (appT (conT ''MimeRender) (conT n)) (getType t)) [mr]
     let bs v = Just (appE (varE 'C8.pack) (litE $ stringL v))
     let ct = funD 'contentType [clause [wildP] (normalB (infixE (bs "text") (varE '(//)) (bs "html"))) []]
     accept <- instanceD (cxt []) (appT (conT ''Accept) (conT n)) [ct]
-    return $ [dt, mime, accept]
+    return $ decs ++ [dt, mime, accept]
 
+-- | Content type for text/html.
+--
+-- This content type can be used with @Handler@ function returning @Renderer@.
+-- You can select the template in @Handler@ function
+-- by declaring this type as the content type of the API and implementing @Handler@ function to return @Handler Renderer@.
+--
+-- > [tmpl| Page1 template/page1.html String |]
+-- > [tmpl| Page2 template/page2.html String |]
+-- > type API = "path" :> Capture "x" Int :> Get '[HTML] Renderer
+-- > someHandler :: Int -> Handler Renderer
+-- > someHandler v = return $ if v > 0 then Renderer (Proxy :: Proxy Page1) "abc" else Renderer (Proxy :: Proxy Page2) "def"
 data HTML
 
+-- | Holds a content type and a value to be rendered.
+--
+-- This type is designed to be used as the returned type of a @Handler@ to control content type by each request.
 data Renderer = forall t a. (MimeRender t a)
-    => Renderer { renderType :: Proxy t
-                , renderValue :: a
+    => Renderer { renderType :: Proxy t -- ^ Type of the content type.
+                , renderValue :: a -- ^ Value to be rendered.
                 }
+     | Redirect String
 
 instance Accept HTML where
     contentType _ = C8.pack "text" // C8.pack "html"

@@ -8,7 +8,7 @@ module Ext.Servant.Validation where
 
 import GHC.Generics
 import Control.Applicative
-import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as B
 import qualified Data.Map as M
 import qualified Data.List as L
 import Language.Haskell.TH
@@ -28,7 +28,22 @@ data Pointer = RawPointer
 -- needs extensible design.
 data Source = StringValidatable String
             | ByteStringValidatable B.ByteString
+            | TextValidatable T.Text
             deriving (Show, Eq, Generic)
+
+class ToSource a where
+    toSource :: a -> Source
+
+instance ToSource Value where
+    toSource (Object v) = ByteStringValidatable (encode v)
+    toSource (Array v) = ByteStringValidatable (encode v)
+    toSource (String v) = TextValidatable (v)
+    toSource (Number v) = StringValidatable (show v)
+    toSource (Bool v) = StringValidatable (if v then "true" else "false")
+    toSource Null = StringValidatable "null"
+
+instance ToSource T.Text where
+    toSource = TextValidatable
 
 -- TODO
 -- needs more flexible formatting library than Text.Printf or Formatting.
@@ -36,20 +51,20 @@ type ValidationError = String
 
 data F a = F { value :: Maybe a
              , alternative :: Maybe a
-             , origin :: Source
+             , source :: Source
              , error :: Maybe ValidationError
              } deriving (Generic)
 
 instance (FromJSON a) => FromJSON (F a) where
     parseJSON v =
-        (parseJSON v :: Parser a) >>= \v' -> return (F (Just v') Nothing undefined Nothing)
-            <|> return (F Nothing Nothing undefined (Just "Validation Error"))
+        (parseJSON v :: Parser a) >>= \v' -> return (F (Just v') Nothing (toSource v) Nothing)
+            <|> return (F Nothing Nothing (toSource v) (Just "Validation Error"))
 
 instance (FromHttpApiData a) => FromHttpApiData (F a) where
     parseUrlPiece t =
         case (parseUrlPiece t :: Either T.Text a) of
-            Right v -> Right (F (Just v) Nothing undefined Nothing)
-            Left _ -> Right (F Nothing Nothing undefined (Just "Validation Error"))
+            Right v -> Right (F (Just v) Nothing (toSource t) Nothing)
+            Left _ -> Right (F Nothing Nothing (toSource t) (Just "Validation Error"))
 
 class Validatable v a where
     validate :: v -> Maybe a
@@ -65,7 +80,7 @@ stripSuffix = reverse . strip . reverse
 
 {- | Declares new data type which has equivalent fields to given type.
 
-    Type of each field is @F a@ where @a@ is the type of the equivalent field of original type.
+    Type of each field is @F a@ where @a@ is the type of the equivalent field of sou type.
 
     > data A = A { f1 :: String, f2 :: Int } deriving (Generic)
     >

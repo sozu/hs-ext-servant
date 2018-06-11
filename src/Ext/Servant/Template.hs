@@ -6,6 +6,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Ext.Servant.Template where
 
@@ -140,10 +141,11 @@ data Renderer = forall t a. (MimeRender t a)
     => Renderer { renderType :: Proxy t -- ^ Type of the content type.
                 , renderValue :: a -- ^ Value to be rendered.
                 }
-     | Redirect String
+     | EmptyContent
 
 instance Accept HTML where
     contentType _ = C8.pack "text" // C8.pack "html"
 
-instance MimeRender HTML Renderer where
+instance (Accept a) => MimeRender a Renderer where
     mimeRender _ (Renderer t v) = mimeRender t v
+    mimeRender _ EmptyContent = ""

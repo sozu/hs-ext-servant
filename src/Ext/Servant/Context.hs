@@ -56,6 +56,11 @@ import Debug.Trace
 -}
 data RequestContext ks cs = RequestContext Request (Contexts cs) (Keys ks)
 
+-- | Returns a request of the @RequestContet@.
+requestOf :: forall ks cs. RequestContext ks cs -- ^ @RequestContext@.
+          -> Request -- ^ Request.
+requestOf (RequestContext r _ _) = r
+
 -- | Returns a value of specified type from @RequestContext@.
 contextValue :: forall k ks cs. (GetContextKey k ks)
              => RequestContext ks cs -- ^ @RequestContext@.

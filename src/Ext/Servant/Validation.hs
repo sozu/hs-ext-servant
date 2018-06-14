@@ -3,14 +3,16 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-
-{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ExistentialQuantification #-}
 
 module Ext.Servant.Validation where
 
 import GHC.Generics
 import Control.Applicative
+import Data.Proxy
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Map as M
 import qualified Data.List as L
@@ -58,10 +60,19 @@ data F a = F { value :: Maybe a
              , error :: Maybe ValidationError
              } deriving (Generic)
 
-instance (FromJSON a) => FromJSON (F a) where
+instance {-# OVERLAPPABLE #-} (FromJSON a) => FromJSON (F a) where
     parseJSON v =
         (parseJSON v :: Parser a) >>= \v' -> return (F (Just v') Nothing (toSource v) Nothing)
             <|> return (F Nothing Nothing (toSource v) (Just "Validation Error"))
+
+instance {-# OVERLAPPING #-} (FromJSON a, AllVerifiable vs a) => FromJSON (F (a :? vs)) where
+    parseJSON v =
+        let source = toSource v
+            pvs = Proxy :: Proxy vs
+        in (parseJSON v :: Parser a) >>= \v' -> return (case verifyAll pvs v' of
+                                                            Left e -> F Nothing Nothing source (Just e)
+                                                            Right v'' -> F (Just $ SafeData v'' pvs) Nothing source Nothing)
+            <|> return (F Nothing Nothing source (Just "Validation Error"))
 
 instance (FromHttpApiData a) => FromHttpApiData (F a) where
     parseUrlPiece t =
@@ -156,102 +167,24 @@ validatable ns = concat <$> mapM conv ns
 
 
 ----
+
+class Verifier v a where
+    verify :: Proxy v -> a -> Either ValidationError a
+
+--instance Verifier (MinLen n) String where
+--    verify p s = Right s
+--instance Verifier (MaxLen n) String where
+--    verify p s = Right s
 --
---data VerifiableField t = forall r. VerifiableField (t -> r) [r -> Maybe ValidationError]
---
---v :: forall t r. (t -> r)
---  -> [r -> Maybe ValidationError]
---  -> VerifiableField t
---v f = VerifiableField f
---
---verify :: t
---       -> VerifiableField t
---       -> Maybe ValidationError
---verify v (VerifiableField f cs) = case value (f v) of
---    Just r -> find isJust $ map (\c -> c r) cs
---    Nothing -> Nothing
---
---validateFields :: t
---               -> [VerifiableField t]
---               -> Maybe ValidationError
---validateFields v [] = Nothing
---validateFields v (f:fs) = case verify v f of
---                            Just e -> Just e
---                            _ -> validateFields v fs
---
---data Validation = forall t. Validation [VerifiableField t]
---
---vv :: forall t. [VerifiableField t]
---   -> Validation
---vv fs = Validation fs
---
----- data PublishForm where
-----     Create :: {
-----         name :: String
-----       , age :: Int
-----       , desc :: String
-----       } -> PublishForm
-----     Update :: {
-----         age :: Int
-----       , desc :: String
-----       } -> PublishForm
---
----- data PublishForm a where
-----     Create :: {
-----         name :: String
-----       , age :: Int
-----       , desc :: String
-----       } -> PublishForm Create
-----     Update :: {
-----         age :: Int
-----       , desc :: String
-----       } -> PublishForm Update
---
----- $(validatable ''PublishForm [ ('name [minLen 10, maxLen 20])
-----                             , ('age [minInt 10])
-----                             ])
---
----- $(validatable' [ vv @AAA [ v a1 [minLen 10, maxLen 20]
-----                          , v a2 [minInt 10]
-----                          , v a3 [verifyBBB]
-----                          ]
-----                ])
-----
----- data AAA' = AAA' { a1' :: F String
-----                  , a2' :: F Int
-----                  , a3' :: F BBB
-----                  }
-----
----- instance Validatable AAA' AAA where
-----     ...
-----
----- instance Verifiable AAA' where
-----     verify v = v { a1' = let err = value a1' v >>= minLen 10 >>= maxLen 20
-----                          case err of
-----                              Just e -> F { value = Nothing, error = Just e }
-----                              Nothing -> a1'
-----
----- verifyF :: F a -> F a
-----
----- Fにバリデーションロジックを持たせる？
-----
---validatable' :: [Validation] -> Int
---validatable' = length
---    where
---        val :: Validation -> DecQ
---        val (Validation fs) = do
---
---
---data AAA = AAA { a1 :: String, a2 :: Int }
---
---minLen :: Int -> (String -> Maybe ValidationError)
---minLen v = \s -> if length s < v then Just "too short" else Nothing
---
---maxLen :: Int -> (String -> Maybe ValidationError)
---maxLen v = \s -> if length s > v then Just "too long" else Nothing
---
---minInt :: Int -> (Int -> Maybe ValidationError)
---minInt v = \i -> if i < v then Just "too small" else Nothing
---
---vr = validatable' [vv @AAA [v a1 [minLen 10, maxLen 20], v a2 [minInt 10]]]
---
+--type PersonName = String :? '[MinLen 10, MaxLen 20]
+
+data (:?) a (vs :: [*]) = forall a vs. (AllVerifiable vs a) => SafeData a (Proxy vs)
+
+class AllVerifiable (vs :: [*]) a where
+    verifyAll :: Proxy vs -> a -> Either ValidationError a
+
+instance AllVerifiable '[] a where
+    verifyAll _ a = Right a
+
+instance (Verifier v a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
+    verifyAll _ a = verify (Proxy :: Proxy v) a >>= verifyAll (Proxy :: Proxy vs)

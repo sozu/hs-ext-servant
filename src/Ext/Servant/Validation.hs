@@ -7,19 +7,24 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
 
 module Ext.Servant.Validation where
 
 import GHC.Generics
 import Control.Applicative
+import Control.Monad
+import Control.Monad.Except (catchError)
 import Data.Proxy
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Map as M
 import qualified Data.List as L
 import Language.Haskell.TH
 import qualified Data.Text as T
-import Data.Maybe (maybe)
+import Data.Maybe (maybe, catMaybes)
 import Data.Aeson as J
+import qualified Data.Aeson.BetterErrors as JB
 import Data.Aeson.Types
 import Web.FormUrlEncoded as F
 import Web.HttpApiData
@@ -34,6 +39,7 @@ data Pointer = RawPointer
 data Source = StringValidatable String
             | ByteStringValidatable B.ByteString
             | TextValidatable T.Text
+            | EmptyValidatable
             deriving (Show, Eq, Generic)
 
 class ToSource a where
@@ -57,13 +63,13 @@ type ValidationError = String
 data F a = F { value :: Maybe a
              , alternative :: Maybe a
              , source :: Source
-             , error :: Maybe ValidationError
+             , cause :: Maybe ValidationError
              } deriving (Generic)
 
-instance {-# OVERLAPPABLE #-} (FromJSON a) => FromJSON (F a) where
-    parseJSON v =
-        (parseJSON v :: Parser a) >>= \v' -> return (F (Just v') Nothing (toSource v) Nothing)
-            <|> return (F Nothing Nothing (toSource v) (Just "Validation Error"))
+--instance {-# OVERLAPPABLE #-} (FromJSON a) => FromJSON (F a) where
+--    parseJSON v =
+--        (parseJSON v :: Parser a) >>= \v' -> return (F (Just v') Nothing (toSource v) Nothing)
+--            <|> return (F Nothing Nothing (toSource v) (Just "Validation Error"))
 
 instance {-# OVERLAPPING #-} (FromJSON a, AllVerifiable vs a) => FromJSON (F (a :? vs)) where
     parseJSON v =
@@ -82,6 +88,7 @@ instance (FromHttpApiData a) => FromHttpApiData (F a) where
 
 class Validatable v a where
     validate :: v -> Maybe a
+    errors :: Proxy a -> v -> [ValidationError]
 
 jsonOptions = defaultOptions { J.fieldLabelModifier = stripSuffix, J.omitNothingFields = True }
 formOptions = defaultFormOptions { F.fieldLabelModifier = stripSuffix }
@@ -100,12 +107,17 @@ stripSuffix = reverse . strip . reverse
     >
     > -- $(validatable [''A]) generates code below.
     >
-    > data A' = A' { f1 :: F String, f2 :: F Int } deriving (Generic)
-    > instance FromJSON A'
+    > data A' = A' { f1' :: F String, f2' :: F Int } deriving (Generic)
+    >
+    > instance FromJSONBetterErrors A' where
+    >     fromJSONBetterErrors = A' <$> asField "f1" (Proxy :: Proxy (F String))
+    >                               <*> asField "f2" (Proxy :: Proxy (F Int))
+    >
     > instance FromForm A'
     >
     > instance Validatable A' A where
-    >      validate v = A <$> value (f1 v) <*> value (f2 v)
+    >      validate v = A <$> value (f1' v) <*> value (f2' v)
+    >      errors _ v = catMaybes [cause (f1' v), cause (f2' v)]
 -}
 validatable :: [Name]
             -> Q [Dec]
@@ -113,14 +125,14 @@ validatable ns = concat <$> mapM conv ns
     where
         conv :: Name -> Q [Dec]
         conv name = do
-            TyConI (DataD cxt _ tvs kind (c@(RecC cn recs):_) drvs) <- reify name
+            TyConI (DataD _ _ tvs kind (c@(RecC cn recs):_) drvs) <- reify name
             let (f0:fs) = map (\(rn, _, _) -> fn' rn) recs
             let vn = mkName "v"
+            let c' = con' n' c
+            bfj <- deriveBetterFromJSON n' c'
             return [
                 DataD [] n' [] Nothing [con' n' c] [DerivClause Nothing [(ConT ''Generic)]]
-              , InstanceD Nothing [] (AppT (ConT ''FromJSON) (ConT n')) [
-                  FunD 'parseJSON [Clause [] (NormalB $ AppE (VarE 'genericParseJSON) (VarE 'jsonOptions)) []]
-                ]
+              , bfj
               , InstanceD Nothing [] (AppT (ConT ''FromForm) (ConT n')) [
                   FunD 'fromForm [Clause [] (NormalB $ AppE (VarE 'genericFromForm) (VarE 'formOptions)) []]
                 ]
@@ -128,6 +140,11 @@ validatable ns = concat <$> mapM conv ns
                   FunD 'validate [Clause
                                     [VarP vn]
                                     (NormalB $ v' vn (InfixE (Just $ ConE cn) (VarE '(<$>)) (Just $ val f0 vn)) fs)
+                                    []
+                                    ]
+                , FunD 'errors [Clause
+                                    [WildP, VarP vn]
+                                    (NormalB $ AppE (VarE 'catMaybes) (fs' vn fs))
                                     []
                                     ]
                 ]
@@ -145,6 +162,8 @@ validatable ns = concat <$> mapM conv ns
                 -- Generates expression where @value@ is applied to a field (fn) in an object (vn).
                 val :: Name -> Name -> Exp
                 val fn vn = AppE (VarE 'value) (AppE (VarE fn) (SigE (VarE vn) (ConT n')))
+                fs' :: Name -> [Name] -> Exp
+                fs' vn fs = ListE (map (\f -> AppE (VarE 'cause) (AppE (VarE f) (VarE vn))) fs)
                 -- Generates body of @validate@ implementation by concatenating [| value (f1 v) |] expressions with (<*>).
                 v' :: Name -> Exp -> [Name] -> Exp
                 v' vn acc [] = acc
@@ -178,7 +197,12 @@ class Verifier v a where
 --
 --type PersonName = String :? '[MinLen 10, MaxLen 20]
 
-data (:?) a (vs :: [*]) = forall a vs. (AllVerifiable vs a) => SafeData a (Proxy vs)
+--data (:?) a (vs :: [*]) = forall a vs. (AllVerifiable vs a) => SafeData a (Proxy vs)
+data (:?) a (vs :: [*]) = SafeData a (Proxy vs)
+
+safeData :: (a :? vs)
+         -> a
+safeData (SafeData v _) = v
 
 class AllVerifiable (vs :: [*]) a where
     verifyAll :: Proxy vs -> a -> Either ValidationError a
@@ -188,3 +212,73 @@ instance AllVerifiable '[] a where
 
 instance (Verifier v a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
     verifyAll _ a = verify (Proxy :: Proxy v) a >>= verifyAll (Proxy :: Proxy vs)
+
+class FromJSONBetterErrors a where
+    fromJSONBetterErrors :: JB.Parse' a
+
+instance (FromJSONBetterErrors a) => FromJSON a where
+    parseJSON = JB.toAesonParser' fromJSONBetterErrors
+
+{- | Generates declaration of function to parse given type in aeson-better-errors style.
+
+    > data A = A { f1 :: String, f2 :: Maybe Int }
+    > $(deriveBetterFromJSON ''A)
+    >
+    > instance FromJSONBetterErrors A where
+    >     fromJSONBetterErrors = A <$> key "f1" asString <*> keyMay "f2" asIntegral
+-}
+deriveBetterFromJSON :: Name
+                     -> Con
+                     -> DecQ
+deriveBetterFromJSON n c@(RecC cn recs) = do
+    --TyConI (DataD _ _ _ _ (RecC cn recs:_) _) <- reify n
+    let fjbe = funD 'fromJSONBetterErrors [clause [] (normalB $ asFields cn recs) []]
+    instanceD (cxt []) (appT (conT ''FromJSONBetterErrors) (conT n)) [fjbe]
+    where
+        asFields :: Name -> [(Name, Bang, Type)] -> ExpQ
+        asFields cn rs = do
+            recs <- mapM (\(rn, _, rt) -> [| asField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) |]) rs
+            return $ applicativeCon cn recs
+
+        applicativeCon :: Name -> [Exp] -> Exp
+        applicativeCon cn [] = ConE cn
+        applicativeCon cn (a:as) = applicativeAcc (InfixE (Just $ ConE cn) (VarE '(<$>)) (Just a)) as
+
+        applicativeAcc :: Exp -> [Exp] -> Exp
+        applicativeAcc b [] = b
+        applicativeAcc b (e:es) = applicativeAcc (InfixE (Just b) (VarE '(<*>)) (Just e)) es
+
+class AsType a where
+    asType :: Proxy a -> JB.Parse err a
+
+instance AsType [Char] where
+    asType _ = JB.asString
+instance {-# OVERLAPPABLE #-} (Integral a) => AsType a where
+    asType _ = JB.asIntegral
+instance AsType Bool where
+    asType _ = JB.asBool
+instance {-# OVERLAPPABLE #-} (AsType a) => AsType [a] where
+    asType _ = JB.eachInArray $ asType (Proxy :: Proxy a)
+
+class AsField a where
+    asField :: Proxy a -> String -> JB.Parse err a
+instance {-# OVERLAPPABLE #-} (AsType a) => AsField a where
+    asField p n = JB.key (T.pack n) (asType p)
+instance (AsType a) => AsField (Maybe a) where
+    asField _ n = JB.keyMay (T.pack n) (asType (Proxy :: Proxy a))
+instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
+    -- FIXME alternativeが適当。
+    asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
+instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
+    asField _ n =
+        let pvs = Proxy :: Proxy vs
+        in (asField (Proxy :: Proxy a) n >>= \v -> return $
+                case verifyAll pvs v of
+                    Left e -> F Nothing Nothing EmptyValidatable (Just e)
+                    Right v' -> F (Just $ SafeData v' pvs) Nothing EmptyValidatable Nothing
+           ) `catchError` \e -> return $ case e of
+                JB.InvalidJSON s -> F Nothing Nothing (StringValidatable s) (Just $ "invalid JSON string")
+                JB.BadSchema _ es -> case es of
+                    JB.KeyMissing _ -> F Nothing Nothing EmptyValidatable (Just $ "not exist: " ++ n)
+                    JB.WrongType _ v -> F Nothing Nothing (toSource v) (Just $ "wrong type: " ++ n)
+                    _ -> F Nothing Nothing EmptyValidatable (Just $ "unknown error")

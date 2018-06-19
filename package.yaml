@@ -38,6 +38,7 @@ dependencies:
 - servant-server
 - wai
 - aeson
+- aeson-better-errors
 - monad-logger
 - fast-logger
 - vault
@@ -67,4 +68,5 @@ tests:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
+    - hspec
     - hs-ext-servant

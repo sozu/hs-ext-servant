@@ -34,6 +34,7 @@ dependencies:
 - bytestring
 - http-media
 - http-api-data
+- http-types
 - servant
 - servant-server
 - wai

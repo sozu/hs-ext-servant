@@ -66,11 +66,6 @@ data F a = F { value :: Maybe a
              , cause :: Maybe ValidationError
              } deriving (Generic)
 
---instance {-# OVERLAPPABLE #-} (FromJSON a) => FromJSON (F a) where
---    parseJSON v =
---        (parseJSON v :: Parser a) >>= \v' -> return (F (Just v') Nothing (toSource v) Nothing)
---            <|> return (F Nothing Nothing (toSource v) (Just "Validation Error"))
-
 instance {-# OVERLAPPING #-} (FromJSON a, AllVerifiable vs a) => FromJSON (F (a :? vs)) where
     parseJSON v =
         let source = toSource v
@@ -80,15 +75,20 @@ instance {-# OVERLAPPING #-} (FromJSON a, AllVerifiable vs a) => FromJSON (F (a 
                                                             Right v'' -> F (Just $ SafeData v'' pvs) Nothing source Nothing)
             <|> return (F Nothing Nothing source (Just "Validation Error"))
 
-instance (FromHttpApiData a) => FromHttpApiData (F a) where
-    parseUrlPiece t =
-        case (parseUrlPiece t :: Either T.Text a) of
-            Right v -> Right (F (Just v) Nothing (toSource t) Nothing)
-            Left _ -> Right (F Nothing Nothing (toSource t) (Just "Validation Error"))
+--instance (FromHttpApiData a) => FromHttpApiData (F a) where
+--    parseUrlPiece t =
+--        case (parseUrlPiece t :: Either T.Text a) of
+--            Right v -> Right (F (Just v) Nothing (toSource t) Nothing)
+--            Left _ -> Right (F Nothing Nothing (toSource t) (Just "Validation Error"))
 
 class Validatable v a where
     validate :: v -> Maybe a
     errors :: Proxy a -> v -> [ValidationError]
+
+errorsOf :: forall a v. (Validatable v a)
+         => v
+         -> [ValidationError]
+errorsOf v = errors (Proxy :: Proxy a) v
 
 jsonOptions = defaultOptions { J.fieldLabelModifier = stripSuffix, J.omitNothingFields = True }
 formOptions = defaultFormOptions { F.fieldLabelModifier = stripSuffix }
@@ -113,7 +113,9 @@ stripSuffix = reverse . strip . reverse
     >     fromJSONBetterErrors = A' <$> asField "f1" (Proxy :: Proxy (F String))
     >                               <*> asField "f2" (Proxy :: Proxy (F Int))
     >
-    > instance FromForm A'
+    > instance FromForm A' where
+    >     fromForm f = A' <$> asFormField "f1" f
+    >                     <*> asFormField "f2" f
     >
     > instance Validatable A' A where
     >      validate v = A <$> value (f1' v) <*> value (f2' v)
@@ -130,12 +132,14 @@ validatable ns = concat <$> mapM conv ns
             let vn = mkName "v"
             let c' = con' n' c
             bfj <- deriveBetterFromJSON n' c'
+            ff <- deriveFromForm n' c'
             return [
                 DataD [] n' [] Nothing [con' n' c] [DerivClause Nothing [(ConT ''Generic)]]
               , bfj
-              , InstanceD Nothing [] (AppT (ConT ''FromForm) (ConT n')) [
-                  FunD 'fromForm [Clause [] (NormalB $ AppE (VarE 'genericFromForm) (VarE 'formOptions)) []]
-                ]
+              , ff
+              --, InstanceD Nothing [] (AppT (ConT ''FromForm) (ConT n')) [
+              --    FunD 'fromForm [Clause [] (NormalB $ AppE (VarE 'genericFromForm) (VarE 'formOptions)) []]
+              --  ]
               , InstanceD Nothing [] (AppT (AppT (ConT ''Validatable) (ConT n')) (ConT name)) [
                   FunD 'validate [Clause
                                     [VarP vn]
@@ -216,7 +220,7 @@ instance (Verifier v a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
 class FromJSONBetterErrors a where
     fromJSONBetterErrors :: JB.Parse' a
 
-instance (FromJSONBetterErrors a) => FromJSON a where
+instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
     parseJSON = JB.toAesonParser' fromJSONBetterErrors
 
 {- | Generates declaration of function to parse given type in aeson-better-errors style.
@@ -240,14 +244,6 @@ deriveBetterFromJSON n c@(RecC cn recs) = do
             recs <- mapM (\(rn, _, rt) -> [| asField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) |]) rs
             return $ applicativeCon cn recs
 
-        applicativeCon :: Name -> [Exp] -> Exp
-        applicativeCon cn [] = ConE cn
-        applicativeCon cn (a:as) = applicativeAcc (InfixE (Just $ ConE cn) (VarE '(<$>)) (Just a)) as
-
-        applicativeAcc :: Exp -> [Exp] -> Exp
-        applicativeAcc b [] = b
-        applicativeAcc b (e:es) = applicativeAcc (InfixE (Just b) (VarE '(<*>)) (Just e)) es
-
 class AsType a where
     asType :: Proxy a -> JB.Parse err a
 
@@ -268,7 +264,8 @@ instance (AsType a) => AsField (Maybe a) where
     asField _ n = JB.keyMay (T.pack n) (asType (Proxy :: Proxy a))
 instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
     -- FIXME alternativeが適当。
-    asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
+    asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n
+                    >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
 instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
     asField _ n =
         let pvs = Proxy :: Proxy vs
@@ -282,3 +279,46 @@ instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
                     JB.KeyMissing _ -> F Nothing Nothing EmptyValidatable (Just $ "not exist: " ++ n)
                     JB.WrongType _ v -> F Nothing Nothing (toSource v) (Just $ "wrong type: " ++ n)
                     _ -> F Nothing Nothing EmptyValidatable (Just $ "unknown error")
+
+deriveFromForm :: Name
+               -> Con
+               -> DecQ
+deriveFromForm n c@(RecC cn recs) = do
+    let ff = funD 'fromForm [clause [varP $ mkName "f"] (normalB $ asFields cn recs) []]
+    instanceD (cxt []) (appT (conT ''FromForm) (conT n)) [ff]
+    where
+        asFields :: Name -> [(Name, Bang, Type)] -> ExpQ
+        asFields cn rs = do
+            recs <- mapM (\(rn, _, rt) -> [| asFormField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) f |]) rs
+            return $ applicativeCon cn recs
+
+class AsFormField a where
+    asFormField :: Proxy a -> String -> Form -> Either T.Text a
+
+instance {-# OVERLAPPABLE #-} (FromHttpApiData a) => AsFormField a where
+    asFormField _ n f = F.parseUnique (T.pack n) f
+instance (FromHttpApiData a) => AsFormField [a] where
+    asFormField _ n f = F.parseAll (T.pack n) f
+instance {-# OVERLAPPING #-} AsFormField String where
+    asFormField _ n f = F.parseUnique (T.pack n) f
+instance {-# OVERLAPS #-} (FromHttpApiData a) => AsFormField (Maybe a) where
+    asFormField _ n f = F.parseMaybe (T.pack n) f
+instance {-# OVERLAPPABLE #-} (AsFormField a) => AsFormField (F a) where
+    asFormField _ n f = asFormField (Proxy :: Proxy (F (a :? '[]))) n f
+                            >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
+instance {-# OVERLAPPABLE #-} (AsFormField a, AllVerifiable vs a) => AsFormField (F (a :? vs)) where
+    asFormField _ n f =
+        let pvs = Proxy :: Proxy vs
+        in return $ case asFormField (Proxy :: Proxy a) n f of
+                        Right v -> case verifyAll pvs v of
+                                    Left e -> F Nothing Nothing EmptyValidatable (Just e)
+                                    Right v' -> F (Just $ SafeData v' pvs) Nothing EmptyValidatable Nothing
+                        Left e -> F Nothing Nothing EmptyValidatable (Just $ T.unpack e)
+
+applicativeCon :: Name -> [Exp] -> Exp
+applicativeCon cn [] = ConE cn
+applicativeCon cn (a:as) = applicativeAcc (InfixE (Just $ ConE cn) (VarE '(<$>)) (Just a)) as
+
+applicativeAcc :: Exp -> [Exp] -> Exp
+applicativeAcc b [] = b
+applicativeAcc b (e:es) = applicativeAcc (InfixE (Just b) (VarE '(<*>)) (Just e)) es

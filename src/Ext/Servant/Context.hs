@@ -16,12 +16,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ExistentialQuantification #-}
 
 module Ext.Servant.Context where
 
 import GHC.TypeLits
 import Data.Proxy
-import Data.Maybe (fromJust)
+import Data.Maybe (fromJust, maybe)
 import Data.IORef
 import Control.Monad.IO.Class
 import Control.Monad.Reader
@@ -31,8 +32,13 @@ import Control.Monad.Trans.Control
 import Control.Monad.Logger
 import Control.Exception.Safe hiding (Handler)
 import qualified Data.Vault.Lazy as V
+import qualified Data.ByteString.Lazy as B
+import Data.String
 import Network.Wai
+import Network.HTTP.Media
+import Network.HTTP.Types
 import Servant.API
+import Servant.API.ContentTypes
 import Servant.Server
 import Servant.Server.Internal
 import Data.Resource
@@ -56,7 +62,21 @@ import Debug.Trace
 -}
 data RequestContext ks cs = RequestContext Request (Contexts cs) (Keys ks)
 
--- | Returns a request of the @RequestContet@.
+-- | Throwable error type to be rendered according to media type specified by Accept header.
+class Erroneous e where
+    type ErroneousTypes e :: [*]
+    buildError :: e -> MediaType -> ServantErr
+
+errorFor :: forall e ks cs. (Erroneous e, AllMime (ErroneousTypes e))
+         => e
+         -> RequestContext ks cs
+         -> ServantErr
+errorFor e rc = buildError e mt
+    where
+        mt = maybe ("text" // "plain") id $ lookup hAccept (requestHeaders $ requestOf rc)
+                                                >>= matchAccept (allMime (Proxy :: Proxy (ErroneousTypes e)))
+
+-- | Returns a request of the @RequestContext@.
 requestOf :: forall ks cs. RequestContext ks cs -- ^ @RequestContext@.
           -> Request -- ^ Request.
 requestOf (RequestContext r _ _) = r
@@ -209,7 +229,7 @@ rhs (_ :<|> b) = b
 -- | Declares a method to invoke given handler by providing @RequestContext@.
 class WrapHandler h (ks :: [*]) (rs :: [*]) where
     -- | Invokes a handler taking @RequestContext@ as its first argument.
-    wrapHandler :: forall context m a cs. (
+    wrapHandler :: forall context m a cs contentType. (
                   cs ~ ContextTypes (Refs rs)
                 , HasContextEntry context (RequestContextEntry ks rs)
                 , ContextResources (Refs cs) (Refs rs))
@@ -257,9 +277,13 @@ instance ( WrapHandler (Server api) ks rs
          , ContextResources (Refs cs) (Refs rs)) => HasServer ((@>) (rs :: [*]) (ks :: [*]) :> api) context where
     type ServerT ((@>) rs ks :> api) m = RequestContext ks (R2C rs) -> ServerT api m
 
-    route p context (Delayed {..}) = route (Proxy :: Proxy api) context (Delayed { serverD = serverD', ..})
+    route p context (Delayed {..}) = route (Proxy :: Proxy api) context delayed'
         where
             serverD' c p h a b r = wrapHandler (Proxy :: Proxy rs) (Proxy :: Proxy ks) context r <$> serverD c p h a b r
+            delayed' = Delayed { serverD = serverD'
+                               --, bodyD = \ct -> (,) <$> bodyD ct <*> return ct
+                               , ..
+                               }
 
     hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt . s
 
@@ -405,27 +429,28 @@ instance ( FilterHandler f (ServerT api Handler)
     -- s :: ServerT (Filter f :> api) m
     --   == Apply (FilterArgs f) (ServerT api m)
     --   == a1 -> ... -> an -> ServerT api m
-    --
-    -- hoistServerWithContext (Proxy :: Proxy api) pc nt :: ServerT api m -> ServerT api n
-    --
-    -- 結果の型は、
-    -- ServerT (Filter f :> api) n
-    -- でなければならない。
-    -- すなわち、
-    -- Apply (FilterArgs f) (ServerT api n)
-    -- 右辺は、
-    -- (ServerT api m -> ServerT api n) . (Apply (FilterArgs f) (ServerT api m))
-    -- (.) :: (b -> c) -> (a -> b) -> a -> c
-    -- より、
-    -- Apply (FilterArgs f) (ServerT api m) == a -> ServerT api m
-    -- を満たす必要があり、これは推論できない。
-    -- なぜなら、(.)が一つの引数しか取れないから。
-    -- (.*) :: (b -> c) -> (a1 -> .. -> an -> b) -> (a1 -> .. -> an -> c)
-    -- なる関数でつなげば型が一致する。
     hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt `merge'` s
         where
             merge' :: (b -> c) -> Apply (FilterArgs f) b -> Apply (FilterArgs f) c
             merge' = merge (Proxy :: Proxy (FilterArgs f))
+
+-- ------------------------------------------------------------
+-- Other combinators
+-- ------------------------------------------------------------
+
+-- | 
+data Use (a :: *)
+
+instance ( HasServer api context 
+         , HasContextEntry context a
+         ) => HasServer (Use a :> api) context where
+    type ServerT (Use a :> api) m = a -> ServerT api m
+
+    route p context (Delayed {..}) = route (Proxy :: Proxy api) context (Delayed { serverD = serverD', .. })
+        where
+            serverD' c p h a b r = ($ (getContextEntry context :: a)) <$> serverD c p h a b r
+
+    hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt . s
 
 -- ------------------------------------------------------------
 -- Utility type level functions.

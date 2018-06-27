@@ -104,10 +104,12 @@ stripSuffix = reverse . strip . reverse
     Type of each field is @F a@ where @a@ is the type of the equivalent field of sou type.
 
     > data A = A { f1 :: String, f2 :: Int } deriving (Generic)
+    > data B = B { f1 :: String, f2 :: Int , f3 :: A } deriving (Generic)
     >
-    > -- $(validatable [''A]) generates code below.
+    > -- $(validatable [''A, ''B]) generates code below.
     >
     > data A' = A' { f1' :: F String, f2' :: F Int } deriving (Generic)
+    > data B' = B' { f1' :: F String, f2' :: F Int, f3' :: F B' } deriving (Generic)
     >
     > instance FromJSONBetterErrors A' where
     >     fromJSONBetterErrors = A' <$> asField "f1" (Proxy :: Proxy (F String))
@@ -117,8 +119,18 @@ stripSuffix = reverse . strip . reverse
     >     fromForm f = A' <$> asFormField "f1" f
     >                     <*> asFormField "f2" f
     >
+    > instance AsType A' where
+    >     asType _ = fromJSONBetterErrors
+    >
+    > instance AsFormField A' where
+    >     asFormField _ _ _ = Left (T.pack "Nested type is not available as a form field")
+    >
     > instance Validatable A' A where
     >      validate v = A <$> value (f1' v) <*> value (f2' v)
+    >      errors _ v = catMaybes [cause (f1' v), cause (f2' v)]
+    >
+    > instance Validatable B' B where
+    >      validate v = B <$> value (f1' v) <*> value (f2' v) <*> (value >=> validate) (f3' v)
     >      errors _ v = catMaybes [cause (f1' v), cause (f2' v)]
 -}
 validatable :: [Name]
@@ -128,7 +140,7 @@ validatable ns = concat <$> mapM conv ns
         conv :: Name -> Q [Dec]
         conv name = do
             TyConI (DataD _ _ tvs kind (c@(RecC cn recs):_) drvs) <- reify name
-            let (f0:fs) = map (\(rn, _, _) -> fn' rn) recs
+            let (f0:fs) = map (\(rn, _, rt) -> (fn' rn, rt)) recs
             let vn = mkName "v"
             let c' = con' n' c
             bfj <- deriveBetterFromJSON n' c'
@@ -137,9 +149,6 @@ validatable ns = concat <$> mapM conv ns
                 DataD [] n' [] Nothing [con' n' c] [DerivClause Nothing [(ConT ''Generic)]]
               , bfj
               , ff
-              --, InstanceD Nothing [] (AppT (ConT ''FromForm) (ConT n')) [
-              --    FunD 'fromForm [Clause [] (NormalB $ AppE (VarE 'genericFromForm) (VarE 'formOptions)) []]
-              --  ]
               , InstanceD Nothing [] (AppT (AppT (ConT ''Validatable) (ConT n')) (ConT name)) [
                   FunD 'validate [Clause
                                     [VarP vn]
@@ -149,6 +158,21 @@ validatable ns = concat <$> mapM conv ns
                 , FunD 'errors [Clause
                                     [WildP, VarP vn]
                                     (NormalB $ AppE (VarE 'catMaybes) (fs' vn fs))
+                                    []
+                                    ]
+                ]
+              , InstanceD Nothing [] (AppT (ConT ''AsType) (ConT n')) [
+                  FunD 'asType [Clause
+                                    [WildP]
+                                    (NormalB $ VarE 'fromJSONBetterErrors)
+                                    []
+                                    ]
+                ]
+              , InstanceD Nothing [] (AppT (ConT ''AsFormField) (ConT n')) [
+                  FunD 'asFormField [Clause
+                                    [WildP, WildP, WildP]
+                                    (NormalB $ AppE (ConE 'Left)
+                                                    (AppE (VarE 'T.pack) (LitE $ StringL "Nested type is not available as a form field")))
                                     []
                                     ]
                 ]
@@ -164,15 +188,24 @@ validatable ns = concat <$> mapM conv ns
                 app :: Exp -> Exp -> Exp
                 app x y = InfixE (Just x) (VarE '(<*>)) (Just y)
                 -- Generates expression where @value@ is applied to a field (fn) in an object (vn).
-                val :: Name -> Name -> Exp
-                val fn vn = AppE (VarE 'value) (AppE (VarE fn) (SigE (VarE vn) (ConT n')))
-                fs' :: Name -> [Name] -> Exp
-                fs' vn fs = ListE (map (\f -> AppE (VarE 'cause) (AppE (VarE f) (VarE vn))) fs)
+                val :: (Name, Type) -> Name -> Exp
+                val (fn, ft) vn =
+                    let fe t = SigE (VarE fn) (AppT (AppT ArrowT (ConT n')) (AppT (ConT ''F) t))
+                    in case isValidatable ft of
+                        Nothing -> AppE (VarE 'value) (AppE (fe ft) (SigE (VarE vn) (ConT n')))
+                        Just t' -> AppE (InfixE (Just $ VarE 'value) (VarE '(>=>)) (Just $ VarE 'validate)) (AppE (fe t') (SigE (VarE vn) (ConT n')))
+                fs' :: Name -> [(Name, Type)] -> Exp
+                fs' vn fs =
+                    let fe fn t = SigE (VarE fn) (AppT (AppT ArrowT (ConT n')) (AppT (ConT ''F) t))
+                    in ListE $ map (\(f, ft) -> case isValidatable ft of
+                                                    Nothing -> AppE (VarE 'cause) (AppE (fe f ft) (VarE vn))
+                                                    Just t' -> AppE (VarE 'cause) (AppE (fe f t') (VarE vn))
+                                   ) fs
                 -- Generates body of @validate@ implementation by concatenating [| value (f1 v) |] expressions with (<*>).
-                v' :: Name -> Exp -> [Name] -> Exp
+                v' :: Name -> Exp -> [(Name, Type)] -> Exp
                 v' vn acc [] = acc
-                v' vn acc [fn] = app acc (val fn vn)
-                v' vn acc (fn:fns) = v' vn (app acc (val fn vn)) fns
+                v' vn acc [f] = app acc (val f vn)
+                v' vn acc (f:fs) = v' vn (app acc (val f vn)) fs
                 -- Generates data constructor by wrapping all types of fields with @F@.
                 con' :: Name -> Con -> Con
                 con' cn (RecC _ recs) = RecC cn (map (\(rn, bang, ft) -> (fn' rn, bang, AppT (ConT ''F) (ft' ft))) recs)
@@ -218,10 +251,10 @@ instance (Verifier v a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
     verifyAll _ a = verify (Proxy :: Proxy v) a >>= verifyAll (Proxy :: Proxy vs)
 
 class FromJSONBetterErrors a where
-    fromJSONBetterErrors :: JB.Parse' a
+    fromJSONBetterErrors :: JB.Parse err a
 
 instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
-    parseJSON = JB.toAesonParser' fromJSONBetterErrors
+    parseJSON = JB.toAesonParser (\e -> T.pack "Validation feiled") fromJSONBetterErrors
 
 {- | Generates declaration of function to parse given type in aeson-better-errors style.
 

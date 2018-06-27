@@ -65,16 +65,17 @@ data RequestContext ks cs = RequestContext Request (Contexts cs) (Keys ks)
 -- | Throwable error type to be rendered according to media type specified by Accept header.
 class Erroneous e where
     type ErroneousTypes e :: [*]
-    buildError :: e -> MediaType -> ServantErr
+    buildError :: ServantErr -> e -> MediaType -> ServantErr
 
 errorFor :: forall e ks cs. (Erroneous e, AllMime (ErroneousTypes e))
-         => e
+         => ServantErr
+         -> e
          -> RequestContext ks cs
          -> ServantErr
-errorFor e rc = buildError e mt
+errorFor org e rc = maybe org (buildError org e) mt
     where
-        mt = maybe ("text" // "plain") id $ lookup hAccept (requestHeaders $ requestOf rc)
-                                                >>= matchAccept (allMime (Proxy :: Proxy (ErroneousTypes e)))
+        mt = lookup hAccept (requestHeaders $ requestOf rc)
+                >>= matchAccept (allMime (Proxy :: Proxy (ErroneousTypes e)))
 
 -- | Returns a request of the @RequestContext@.
 requestOf :: forall ks cs. RequestContext ks cs -- ^ @RequestContext@.

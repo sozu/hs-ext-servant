@@ -36,6 +36,7 @@ dependencies:
 - http-api-data
 - http-types
 - servant
+- servant-foreign
 - servant-server
 - wai
 - aeson

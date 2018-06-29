@@ -41,6 +41,7 @@ import Servant.API
 import Servant.API.ContentTypes
 import Servant.Server
 import Servant.Server.Internal
+import Servant.Foreign
 import Data.Resource
 import Debug.Trace
 
@@ -288,6 +289,10 @@ instance ( WrapHandler (Server api) ks rs
 
     hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt . s
 
+instance (HasForeign lang ftype api) => HasForeign lang ftype ((@>) (rs :: [*]) (ks :: [*]) :> api) where
+    type Foreign ftype ((@>) (rs :: [*]) (ks :: [*]) :> api) = Foreign ftype api
+    foreignFor lang ftype p req = foreignFor lang ftype (Proxy :: Proxy api) req
+
 -- ------------------------------------------------------------
 -- Handler filter combinator
 -- ------------------------------------------------------------
@@ -435,6 +440,10 @@ instance ( FilterHandler f (ServerT api Handler)
             merge' :: (b -> c) -> Apply (FilterArgs f) b -> Apply (FilterArgs f) c
             merge' = merge (Proxy :: Proxy (FilterArgs f))
 
+instance (HasForeign lang ftype api) => HasForeign lang ftype (Filter f :> api) where
+    type Foreign ftype (Filter f :> api) = Foreign ftype api
+    foreignFor lang ftype p req = foreignFor lang ftype (Proxy :: Proxy api) req
+
 -- ------------------------------------------------------------
 -- Other combinators
 -- ------------------------------------------------------------
@@ -452,6 +461,10 @@ instance ( HasServer api context
             serverD' c p h a b r = ($ (getContextEntry context :: a)) <$> serverD c p h a b r
 
     hoistServerWithContext _ pc nt s = hoistServerWithContext (Proxy :: Proxy api) pc nt . s
+
+instance (HasForeign lang ftype api) => HasForeign lang ftype (Use a :> api) where
+    type Foreign ftype (Use a :> api) = Foreign ftype api
+    foreignFor lang ftype p req = foreignFor lang ftype (Proxy :: Proxy api) req
 
 -- ------------------------------------------------------------
 -- Utility type level functions.

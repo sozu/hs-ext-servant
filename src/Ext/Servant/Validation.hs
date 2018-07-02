@@ -34,17 +34,22 @@ data Pointer = RawPointer
              | KeyPointer String
              deriving (Show, Eq)
 
--- TODO
--- needs extensible design.
+-- | Data source from which each field value is assigned.
+--
+-- TODO: Currently unavailable.
 data Source = StringValidatable String
             | ByteStringValidatable B.ByteString
             | TextValidatable T.Text
             | EmptyValidatable
             deriving (Show, Eq, Generic)
 
+-- | Declares a method to convert a value to Source.
 class ToSource a where
-    toSource :: a -> Source
+    -- | Converts a value to Source.
+    toSource :: a -- ^ A value.
+             -> Source -- ^ Converted Source value.
 
+-- | Declares conversions from JSON component to Source.
 instance ToSource Value where
     toSource (Object v) = ByteStringValidatable (encode v)
     toSource (Array v) = ByteStringValidatable (encode v)
@@ -56,38 +61,44 @@ instance ToSource Value where
 instance ToSource T.Text where
     toSource = TextValidatable
 
--- TODO
--- needs more flexible formatting library than Text.Printf or Formatting.
+-- | Declares types of causes for validation errors.
+--
+-- TODO: Data constructors corresponding to various errors will be defined.
 type ValidationError = String
 
+-- | Wrapper of @a@ holding the value or error cause according to the validation result of a field.
 data F a = F { value :: Maybe a
              , alternative :: Maybe a
              , source :: Source
              , cause :: Maybe ValidationError
-             } deriving (Generic)
+             } deriving (Show, Generic)
 
-instance {-# OVERLAPPING #-} (FromJSON a, AllVerifiable vs a) => FromJSON (F (a :? vs)) where
-    parseJSON v =
-        let source = toSource v
-            pvs = Proxy :: Proxy vs
-        in (parseJSON v :: Parser a) >>= \v' -> return (case verifyAll pvs v' of
-                                                            Left e -> F Nothing Nothing source (Just e)
-                                                            Right v'' -> F (Just $ SafeData v'' pvs) Nothing source Nothing)
-            <|> return (F Nothing Nothing source (Just "Validation Error"))
-
---instance (FromHttpApiData a) => FromHttpApiData (F a) where
---    parseUrlPiece t =
---        case (parseUrlPiece t :: Either T.Text a) of
---            Right v -> Right (F (Just v) Nothing (toSource t) Nothing)
---            Left _ -> Right (F Nothing Nothing (toSource t) (Just "Validation Error"))
-
+-- | Instances of @Validatable@ supplies way to convert from some data source to valid object of @a@.
+-- @v@ is a data type which can hold values enough to construct @a@ object,
+-- and errors happened in conversion from data source to each field of @a@.
+-- @validatable ''A@, which is a TH function, generates another type @A'@ which implements @Validatable A' A@.
 class Validatable v a where
-    validate :: v -> Maybe a
-    errors :: Proxy a -> v -> [ValidationError]
+    -- | Returns valid object of @a@ if the validation succeeded.
+    validate :: v -- ^ Object holding field values of @a@ and validation errors.
+             -> Maybe a -- ^ @Just a@ if validation succeeded, otherwise Nothing.
 
+    -- | Returns a list of validation errors.
+    errors :: Proxy a -- ^ Proxy to determine which instance to be used.
+           -> v -- ^ Object holding field values of @a@ and validation errors.
+           -> [ValidationError] -- ^ List of validation errors.
+
+-- | Same as @errors@ but TypeApplication is available instead of @Proxy@.
+--
+-- > data A = ...
+-- > instance Validatable A' A where
+-- >     ...
+-- > v :: A'
+-- > v = ...
+-- >
+-- > errors (Proxy :: Proxy A) v == errors @A v
 errorsOf :: forall a v. (Validatable v a)
-         => v
-         -> [ValidationError]
+         => v -- ^ Object holding field values of @a@ and validation errors.
+         -> [ValidationError] -- ^ List of validation errors.
 errorsOf v = errors (Proxy :: Proxy a) v
 
 jsonOptions = defaultOptions { J.fieldLabelModifier = stripSuffix, J.omitNothingFields = True }
@@ -101,7 +112,11 @@ stripSuffix = reverse . strip . reverse
 
 {- | Declares new data type which has equivalent fields to given type.
 
-    Type of each field is @F a@ where @a@ is the type of the equivalent field of sou type.
+    The name of the type and its fields are determined by appending @'@ to the origina name.
+    In the new type, type of every field is converted from @a@ to @F a@.
+
+    Besides, several instances of new type is generated for the validation.
+    Validations from JSON or HTTP form are available currently.
 
     > data A = A { f1 :: String, f2 :: Int } deriving (Generic)
     > data B = B { f1 :: String, f2 :: Int , f3 :: A } deriving (Generic)
@@ -109,21 +124,29 @@ stripSuffix = reverse . strip . reverse
     > -- $(validatable [''A, ''B]) generates code below.
     >
     > data A' = A' { f1' :: F String, f2' :: F Int } deriving (Generic)
-    > data B' = B' { f1' :: F String, f2' :: F Int, f3' :: F B' } deriving (Generic)
+    > data B' = B' { f1' :: F String, f2' :: F Int, f3' :: F A' } deriving (Generic)
     >
     > instance FromJSONBetterErrors A' where
     >     fromJSONBetterErrors = A' <$> asField "f1" (Proxy :: Proxy (F String))
     >                               <*> asField "f2" (Proxy :: Proxy (F Int))
+    > instance FromJSONBetterErrors B' where
+    >     ...
     >
     > instance FromForm A' where
     >     fromForm f = A' <$> asFormField "f1" f
     >                     <*> asFormField "f2" f
+    > instance FromForm B' where
+    >     ...
     >
     > instance AsType A' where
     >     asType _ = fromJSONBetterErrors
+    > instance AsType B' where
+    >     ...
     >
     > instance AsFormField A' where
     >     asFormField _ _ _ = Left (T.pack "Nested type is not available as a form field")
+    > instance AsFormField B' where
+    >     ...
     >
     > instance Validatable A' A where
     >      validate v = A <$> value (f1' v) <*> value (f2' v)
@@ -131,7 +154,9 @@ stripSuffix = reverse . strip . reverse
     >
     > instance Validatable B' B where
     >      validate v = B <$> value (f1' v) <*> value (f2' v) <*> (value >=> validate) (f3' v)
-    >      errors _ v = catMaybes [cause (f1' v), cause (f2' v)]
+    >      errors _ v = catMaybes [cause (f1' v), cause (f2' v), cause (f3' v)]
+
+    TODO: @errors@ does not work correctly in nested validatable types.
 -}
 validatable :: [Name]
             -> Q [Dec]
@@ -157,7 +182,7 @@ validatable ns = concat <$> mapM conv ns
                                     ]
                 , FunD 'errors [Clause
                                     [WildP, VarP vn]
-                                    (NormalB $ AppE (VarE 'catMaybes) (fs' vn fs))
+                                    (NormalB $ AppE (VarE 'catMaybes) (fs' vn (f0:fs)))
                                     []
                                     ]
                 ]
@@ -221,11 +246,14 @@ validatable ns = concat <$> mapM conv ns
                 isValidatable (AppT ListT t) = isValidatable t >>= Just . (AppT ListT)
                 isValidatable _ = Nothing
 
-
-----
-
+-- | Instances should provide a verification with @v@ which determines the given @a@ is valid or not.
+--
+-- TODO: Because just Proxy is given, any data used in verification must be a type. Is it enough?
 class Verifier v a where
-    verify :: Proxy v -> a -> Either ValidationError a
+    -- | Determines the @a@ value is valid or not.
+    verify :: Proxy v -- ^ Verifier type.
+           -> a -- ^ Value to verify.
+           -> Either ValidationError a -- ^ If valid, @Right@, otherwise @Left@.
 
 --instance Verifier (MinLen n) String where
 --    verify p s = Right s
@@ -288,6 +316,8 @@ instance AsType Bool where
     asType _ = JB.asBool
 instance {-# OVERLAPPABLE #-} (AsType a) => AsType [a] where
     asType _ = JB.eachInArray $ asType (Proxy :: Proxy a)
+instance AsType Object where
+    asType _ = JB.asObject
 
 class AsField a where
     asField :: Proxy a -> String -> JB.Parse err a
@@ -327,6 +357,9 @@ deriveFromForm n c@(RecC cn recs) = do
 
 class AsFormField a where
     asFormField :: Proxy a -> String -> Form -> Either T.Text a
+
+instance  FromHttpApiData Object where
+    parseUrlPiece _ = Left $ T.pack "Json object type can not be applied to form data"
 
 instance {-# OVERLAPPABLE #-} (FromHttpApiData a) => AsFormField a where
     asFormField _ n f = F.parseUnique (T.pack n) f

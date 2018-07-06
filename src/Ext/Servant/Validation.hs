@@ -324,7 +324,8 @@ class AsField a where
 instance {-# OVERLAPPABLE #-} (AsType a) => AsField a where
     asField p n = JB.key (T.pack n) (asType p)
 instance (AsType a) => AsField (Maybe a) where
-    asField _ n = JB.keyMay (T.pack n) (asType (Proxy :: Proxy a))
+    --asField _ n = JB.keyMay (T.pack n) (asType (Proxy :: Proxy a))
+    asField _ n = JB.keyOrDefault (T.pack n) Nothing (JB.perhaps $ asType (Proxy :: Proxy a))
 instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
     -- FIXME alternativeが適当。
     asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n

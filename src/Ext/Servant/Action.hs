@@ -22,7 +22,7 @@ import Data.Proxy
 import Data.Functor
 import Control.Applicative
 import Control.Monad
-import Control.Monad.Error
+import Control.Monad.Except
 import Control.Monad.Base
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Control

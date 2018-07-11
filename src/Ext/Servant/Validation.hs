@@ -1,5 +1,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -9,6 +10,9 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE GADTs #-}
 
 module Ext.Servant.Validation where
 
@@ -32,7 +36,19 @@ import Web.HttpApiData
 data Pointer = RawPointer
              | IndexPointer Int
              | KeyPointer String
-             deriving (Show, Eq)
+             deriving (Eq)
+
+type PointerPath = [Pointer]
+
+instance {-# OVERLAPPING #-} Show PointerPath where
+    showsPrec 10 [] = showString "(root)"
+    showsPrec 10 (RawPointer : []) = showString "(root)"
+    showsPrec 10 (IndexPointer i : ps) = \s -> "[" ++ show i ++ "]" ++ showsPrec 9 ps s
+    showsPrec 10 (KeyPointer k : ps) = \s -> k ++ showsPrec 9 ps s
+    showsPrec d [] = showString $ ""
+    showsPrec d (RawPointer:ps) = showsPrec d ps
+    showsPrec d (IndexPointer i:ps) = \s -> "[" ++ show i ++ "]" ++ showsPrec d ps s
+    showsPrec d (KeyPointer k:ps) = \s -> "." ++ k ++ showsPrec d ps s
 
 -- | Data source from which each field value is assigned.
 --
@@ -62,9 +78,23 @@ instance ToSource T.Text where
     toSource = TextValidatable
 
 -- | Declares types of causes for validation errors.
---
--- TODO: Data constructors corresponding to various errors will be defined.
-type ValidationError = String
+data ValidationError = ErrorString String
+                     | ValueMissing PointerPath
+                     | forall t. TypeMismatch PointerPath (Proxy t)
+                     | forall v. (Verifier v) => VerificationFailure PointerPath (Proxy v)
+
+instance Eq ValidationError where
+    ErrorString s1 == ErrorString s2 = s1 == s2
+    ValueMissing p1 == ValueMissing p2 = p1 == p2
+    TypeMismatch p1 _ == TypeMismatch p2 _ = p1 == p2
+    VerificationFailure p1 v1 == VerificationFailure p2 v2 = p1 == p2 && eqVerifier v1 v2
+    _ == _ = False
+
+instance Show ValidationError where
+    show (ErrorString s) = s
+    show (ValueMissing ps) = "Value is not found at " ++ show ps
+    show (TypeMismatch ps _) = "Value at " ++ show ps ++ " is not convertible"
+    show (VerificationFailure ps v) = verificationFailure v ps
 
 -- | Wrapper of @a@ holding the value or error cause according to the validation result of a field.
 data F a = F { value :: Maybe a
@@ -249,11 +279,52 @@ validatable ns = concat <$> mapM conv ns
 -- | Instances should provide a verification with @v@ which determines the given @a@ is valid or not.
 --
 -- TODO: Because just Proxy is given, any data used in verification must be a type. Is it enough?
-class Verifier v a where
+class (Eq (Args (VerifierSpec v))) => Verifier v where
+    type VerifiableType v :: *
+    type VerifierSpec v :: [*]
+
+    verifierSpec :: Proxy v -> (String, Args (VerifierSpec v))
+
     -- | Determines the @a@ value is valid or not.
     verify :: Proxy v -- ^ Verifier type.
-           -> a -- ^ Value to verify.
-           -> Either ValidationError a -- ^ If valid, @Right@, otherwise @Left@.
+           -> (VerifiableType v) -- ^ Value to verify.
+           -> Either ValidationError (VerifiableType v) -- ^ If valid, @Right@, otherwise @Left@.
+
+    verificationFailure :: Proxy v
+                        -> [Pointer]
+                        -> String
+    verificationFailure _ ps = "Value at " ++ show ps ++ " is invalid"
+
+class EqVerifier v1 v2 where
+    eqVerifier :: Proxy v1 -> Proxy v2 -> Bool
+
+instance {-# OVERLAPPING #-} (Verifier v) => EqVerifier v v where
+    eqVerifier p1 p2 = verifierSpec p1 == verifierSpec p2
+instance (Verifier v1, Verifier v2) => EqVerifier v1 v2 where
+    eqVerifier _ _ = False
+
+data Args (args :: [*]) where
+    ANil :: Args '[]
+    ACons :: (Eq a) => a -> Args as -> Args (a ': as)
+
+infixr 2 `ACons`
+
+instance Eq (Args '[]) where
+    (==) _ _ = True
+instance (Eq a, Eq (Args as)) => Eq (Args (a ': as)) where
+    (==) (a1 `ACons` as1) (a2 `ACons` as2) = a1 == a2 && as1 == as2
+
+
+--
+--class Shift f args where
+--    shift :: f -> Args args -> r
+--
+--instance (Shift r as) => Shift (a -> r) (a ': as) where
+--    shift f (a `ACons` as) = shift (f a) as
+--
+--shiftTest :: (Int, Bool, String)
+--shiftTest = (,,) `shift` (1 `ACons` True `ACons` "abc" `ACons` ANil :: Args '[Int, Bool, String])
+--
 
 --instance Verifier (MinLen n) String where
 --    verify p s = Right s
@@ -275,14 +346,14 @@ class AllVerifiable (vs :: [*]) a where
 instance AllVerifiable '[] a where
     verifyAll _ a = Right a
 
-instance (Verifier v a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
+instance (Verifier v, VerifiableType v ~ a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
     verifyAll _ a = verify (Proxy :: Proxy v) a >>= verifyAll (Proxy :: Proxy vs)
 
 class FromJSONBetterErrors a where
     fromJSONBetterErrors :: JB.Parse err a
 
 instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
-    parseJSON = JB.toAesonParser (\e -> T.pack "Validation feiled") fromJSONBetterErrors
+    parseJSON = JB.toAesonParser (\e -> T.pack "Validation failed") fromJSONBetterErrors
 
 {- | Generates declaration of function to parse given type in aeson-better-errors style.
 
@@ -331,18 +402,22 @@ instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
     asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n
                     >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
 instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
-    asField _ n =
+    asField _ n = do
         let pvs = Proxy :: Proxy vs
-        in (asField (Proxy :: Proxy a) n >>= \v -> return $
-                case verifyAll pvs v of
-                    Left e -> F Nothing Nothing EmptyValidatable (Just e)
-                    Right v' -> F (Just $ SafeData v' pvs) Nothing EmptyValidatable Nothing
-           ) `catchError` \e -> return $ case e of
-                JB.InvalidJSON s -> F Nothing Nothing (StringValidatable s) (Just $ "invalid JSON string")
+        source <- JB.asValue >>= return . toSource
+        (asField (Proxy :: Proxy a) n >>= \v -> do
+                return $ case verifyAll pvs v of
+                    Left e -> F Nothing Nothing source (Just e)
+                    Right v' -> F (Just $ SafeData v' pvs) Nothing source Nothing
+         ) `catchError` \e -> return $ case e of
+                JB.InvalidJSON s -> F Nothing Nothing (StringValidatable s) (Just $ ErrorString "invalid JSON string")
                 JB.BadSchema _ es -> case es of
-                    JB.KeyMissing _ -> F Nothing Nothing EmptyValidatable (Just $ "not exist: " ++ n)
-                    JB.WrongType _ v -> F Nothing Nothing (toSource v) (Just $ "wrong type: " ++ n)
-                    _ -> F Nothing Nothing EmptyValidatable (Just $ "unknown error")
+                    JB.KeyMissing _ -> F Nothing Nothing source (Just $ ValueMissing [KeyPointer n])
+                    JB.WrongType _ v -> F Nothing Nothing source (Just $ TypeMismatch [KeyPointer n] (Proxy :: Proxy a))
+                    JB.FromAeson s -> F Nothing Nothing source (Just $ ErrorString s)
+                    JB.OutOfBounds _ -> F Nothing Nothing source (Just $ TypeMismatch [KeyPointer n] (Proxy :: Proxy a))
+                    JB.ExpectedIntegral _ -> F Nothing Nothing source (Just $ TypeMismatch [KeyPointer n] (Proxy :: Proxy a))
+                    _ -> F Nothing Nothing EmptyValidatable (Just $ ErrorString $ "unknown error")
 
 deriveFromForm :: Name
                -> Con
@@ -380,7 +455,7 @@ instance {-# OVERLAPPABLE #-} (AsFormField a, AllVerifiable vs a) => AsFormField
                         Right v -> case verifyAll pvs v of
                                     Left e -> F Nothing Nothing EmptyValidatable (Just e)
                                     Right v' -> F (Just $ SafeData v' pvs) Nothing EmptyValidatable Nothing
-                        Left e -> F Nothing Nothing EmptyValidatable (Just $ T.unpack e)
+                        Left e -> F Nothing Nothing EmptyValidatable (Just $ ErrorString $ T.unpack e)
 
 applicativeCon :: Name -> [Exp] -> Exp
 applicativeCon cn [] = ConE cn

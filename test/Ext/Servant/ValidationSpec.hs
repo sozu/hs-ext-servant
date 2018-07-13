@@ -13,17 +13,17 @@ data V1 = V1 { f11 :: F String
              }
 
 instance FromJSONBetterErrors V1 where
-    fromJSONBetterErrors = V1 <$> asField (Proxy :: Proxy (F String)) "f11"
-                              <*> asField (Proxy :: Proxy (F Int)) "f12"
-                              <*> asField (Proxy :: Proxy (F Bool)) "f13"
+    fromJSONBetterErrors = V1 <$> asField (Proxy :: Proxy (F String)) (KeyPointer "f11")
+                              <*> asField (Proxy :: Proxy (F Int)) (KeyPointer "f12")
+                              <*> asField (Proxy :: Proxy (F Bool)) (KeyPointer "f13")
 
 data V2 = V2 { f21 :: F (Maybe String)
              , f22 :: F (Maybe Int)
              }
 
 instance FromJSONBetterErrors V2 where
-    fromJSONBetterErrors = V2 <$> asField (Proxy :: Proxy (F (Maybe String))) "f21"
-                              <*> asField (Proxy :: Proxy (F (Maybe Int))) "f22"
+    fromJSONBetterErrors = V2 <$> asField (Proxy :: Proxy (F (Maybe String))) (KeyPointer "f21")
+                              <*> asField (Proxy :: Proxy (F (Maybe Int))) (KeyPointer "f22")
 
 spec :: Spec
 spec = do

@@ -6,7 +6,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Ext.Servant.THSpec where
+module Ext.Servant.THJSONSpec where
 
 import Test.Hspec
 import GHC.Generics

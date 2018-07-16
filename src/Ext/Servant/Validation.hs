@@ -16,6 +16,7 @@
 
 module Ext.Servant.Validation where
 
+import GHC.Exts (toList)
 import GHC.Generics
 import Control.Applicative
 import Control.Monad
@@ -33,6 +34,7 @@ import Data.Aeson.Types
 import Web.FormUrlEncoded as F
 import Web.HttpApiData
 
+-- | This type indicates the location of parsing value in data source.
 data Pointer = RawPointer
              | IndexPointer Int
              | KeyPointer String
@@ -149,28 +151,37 @@ data FieldType = NormalScalar Type
 {- | Declares new data type which has equivalent fields to given type.
 
     The name of the type and its fields are determined by appending @'@ to the origina name.
-    In the new type, type of every field is converted from @a@ to @F a@.
+    In the new type, type of each field is converted by applying @F@ in following manners.
 
-    Besides, several instances of new type is generated for the validation.
-    Validations from JSON or HTTP form are available currently.
+    - @Maybe a@ is changed to @F (Maybe a)@.
+    - @[a]@ is changed to @F [F a]@.
+    - Other types are simply applied by @F@, that is, @a@ is changed to @F a@.
+    - If the original type @A@ is the type involved in the arguments of the same invocation of this function,
+      @A'@ which is the new type of @A@ is used instead.
 
-    > data A = A { f1 :: String, f2 :: Int } deriving (Generic)
-    > data B = B { f1 :: String, f2 :: Int , f3 :: A } deriving (Generic)
+    Besides, several instances are defined to enable validation from data in the form of JSON or HTTP form.
+    Next code is the example of generated code.
+    (The implementations of @Validatable@ are omitted because they include elaborate part taken to deal with DuplicateRecordFields.)
+
+    > data A = A { a1 :: Int, a2 :: [Int], a3 :: Maybe Int }
+    > data B = B { b1 :: A, b2 :: [A], b3 :: Maybe A }
     >
     > -- $(validatable [''A, ''B]) generates code below.
     >
-    > data A' = A' { f1' :: F String, f2' :: F Int } deriving (Generic)
-    > data B' = B' { f1' :: F String, f2' :: F Int, f3' :: F A' } deriving (Generic)
+    > data A' = A' { a1' :: F Int, a2' :: F [F Int], a3' :: F (Maybe Int) } deriving (Generic)
+    > data B' = B' { b1' :: F A', b2' :: F [F A'], b3' :: F (Maybe A') } deriving (Generic)
     >
     > instance FromJSONBetterErrors A' where
-    >     fromJSONBetterErrors = A' <$> asField "f1" (Proxy :: Proxy (F String))
-    >                               <*> asField "f2" (Proxy :: Proxy (F Int))
+    >     fromJSONBetterErrors = A' <$> asField (Proxy :: Proxy (F Int)) (KeyPointer "a1")
+    >                               <*> asField (Proxy :: Proxy (F [F Int])) (KeyPointer "a2")
+    >                               <*> asField (Proxy :: Proxy (F (Maybe Int))) (KeyPointer "a3")
     > instance FromJSONBetterErrors B' where
     >     ...
     >
     > instance FromForm A' where
-    >     fromForm f = A' <$> asFormField "f1" f
-    >                     <*> asFormField "f2" f
+    >     fromForm f = A' <$> asFormField (Proxy :: Proxy (F Int)) "a1" f
+    >                     <*> asFormField (Proxy :: Proxy (F [F Int])) "a2" f
+    >                     <*> asFormField (Proxy :: Proxy (F (Maybe Int))) "a3" f
     > instance FromForm B' where
     >     ...
     >
@@ -185,12 +196,12 @@ data FieldType = NormalScalar Type
     >     ...
     >
     > instance Validatable A' A where
-    >      validate v = A <$> value (f1' v) <*> value (f2' v)
-    >      errors _ v = catMaybes [cause (f1' v), cause (f2' v)]
+    >      validate v = A <$> ...
+    >      errors _ v = ...
     >
     > instance Validatable B' B where
-    >      validate v = B <$> value (f1' v) <*> value (f2' v) <*> (value >=> validate) (f3' v)
-    >      errors _ v = catMaybes [cause (f1' v), cause (f2' v), cause (f3' v)]
+    >      validate v = B <$> ...
+    >      errors _ v = ...
 
     TODO: should generate instance of FromHttpApiData instead of FromForm ?
 -}
@@ -201,45 +212,27 @@ validatable ns = concat <$> mapM conv ns
         conv :: Name -> Q [Dec]
         conv name = do
             TyConI (DataD _ _ tvs kind (c@(RecC cn recs):_) drvs) <- reify name
-            let (f0:fs) = map (\(rn, _, rt) -> (genFieldName rn, rt)) recs
+            let fields = map (\(rn, _, rt) -> (genFieldName rn, rt)) recs
             let vn = mkName "v"
-            let c' = con' n' c
-            bfj <- deriveBetterFromJSON n' c'
-            ff <- deriveFromForm n' c'
-            return [
-                DataD [] n' [] Nothing [con' n' c] [DerivClause Nothing [(ConT ''Generic)]]
-              , bfj
-              , ff
-              , InstanceD Nothing [] (AppT (AppT (ConT ''Validatable) (ConT n')) (ConT name)) [
-                  FunD 'validate [Clause
-                                    [VarP vn]
-                                    --(NormalB $ v' vn (InfixE (Just $ ConE cn) (VarE '(<$>)) (Just $ appValueExp f0 vn)) fs)
-                                    (NormalB $ validateFor cn vn (f0:fs))
-                                    []
-                                    ]
-                , FunD 'errors [Clause
-                                    [WildP, VarP vn]
-                                    --(NormalB $ AppE (VarE 'catMaybes) (fs' vn (f0:fs)))
-                                    (NormalB $ errorsFor vn (f0:fs))
-                                    []
-                                    ]
-                ]
-              , InstanceD Nothing [] (AppT (ConT ''AsType) (ConT n')) [
-                  FunD 'asType [Clause
-                                    [WildP]
-                                    (NormalB $ VarE 'fromJSONBetterErrors)
-                                    []
-                                    ]
-                ]
-              , InstanceD Nothing [] (AppT (ConT ''AsFormField) (ConT n')) [
-                  FunD 'asFormField [Clause
-                                    [WildP, WildP, WildP]
-                                    (NormalB $ AppE (ConE 'Left)
-                                                    (AppE (VarE 'T.pack) (LitE $ StringL "Nested type is not available as a form field")))
-                                    []
-                                    ]
-                ]
-              ]
+            let c' = constructorOf n' c
+            dJson <- deriveBetterFromJSON n' c'
+            dForm <- deriveFromForm n' c'
+            dValidatable <- [d|
+                    instance Validatable $(conT n') $(conT name) where
+                        validate $(varP vn) = $(validateFor cn vn fields)
+                        errors _ $(varP vn) = $(errorsFor vn fields)
+                |]
+            dParse <- [d|
+                    instance AsType $(conT n') where
+                        asType _ = fromJSONBetterErrors
+                    instance AsFormField $(conT n') where
+                        asFormField _ _ _ = Left $ T.pack "Nested type is not available as a form field."
+                |]
+            return $ concat [[
+                DataD [] n' [] Nothing [constructorOf n' c] [DerivClause Nothing [(ConT ''Generic)]]
+              , dJson
+              , dForm
+              ], dValidatable, dParse]
             where
                 -- Name of validatable data type.
                 n' = genTypeName name
@@ -267,12 +260,12 @@ validatable ns = concat <$> mapM conv ns
                 fieldTypeOf t = NormalScalar t
 
                 -- Generates an implementation of @validate@
-                validateFor :: Name -> Name -> [(Name, Type)] -> Exp
-                validateFor cn vn fields = applicativeCon cn (map (appValueExp vn) fields)
+                validateFor :: Name -> Name -> [(Name, Type)] -> ExpQ
+                validateFor cn vn fields = applicativeCon cn <$> (mapM (appValueExpQ vn) fields)
 
                 -- Generates an implementation of @errors@
-                errorsFor :: Name -> [(Name, Type)] -> Exp
-                errorsFor vn fields = AppE (VarE 'concat) (ListE (map (appCauseExp vn) fields))
+                errorsFor :: Name -> [(Name, Type)] -> ExpQ
+                errorsFor vn fields = appE (varE 'concat) (listE $ map (appCauseExpQ vn) fields)
 
                 -- Generates expression obtaining valid data from a field.
                 -- Normal type:              [| value                ((f1 :: A' -> F String)     (v :: A')) |]
@@ -280,125 +273,54 @@ validatable ns = concat <$> mapM conv ns
                 -- List of normal type:      [| value                ((f1 :: A' -> F [F String]) (v :: A')) >>= sequence . map value |]
                 -- List of validatable type: [| value                ((f1 :: B' -> F [F A'])     (v :: B')) >>= sequence . map (value >=> validate) |]
                 -- Maybe of validatable type:[| value                ((f1 :: B' -> F (Maybe A')) (v :: B')) >>= id >>= return . validate |]
-                appValueExp :: Name -> (Name, Type) -> Exp
-                appValueExp vn (fn, ft) =
-                    let sigV = SigE (VarE vn) (ConT n') -- (v :: A')
-                        sigF t = SigE (VarE fn) (AppT (AppT ArrowT (ConT n')) (AppT (ConT ''F) t)) -- t -> [| f1 :: A' -> F t |]
-                        getV f t = AppE f (AppE (sigF t) sigV) -- f (f1 :: A' -> F t) (v :: A')
-                        seqV f m = InfixE (Just f) (VarE '(>>=)) (Just $ InfixE (Just $ VarE 'sequence) (VarE '(.)) (Just $ AppE (VarE 'map) m)) -- f >>= sequence . map m
-                        listF t = AppT ListT (AppT (ConT ''F) t) -- [F t]
-                        vlvl = InfixE (Just $ VarE 'value) (VarE '(>=>)) (Just $ VarE 'validate) -- value >=> validate
-                    in case fieldTypeOf ft of
-                        NormalScalar t        -> getV (VarE 'value) t
-                        ValidatableScalar _ t -> getV vlvl t
-                        NormalList t          -> seqV (getV (VarE 'value) (listF t)) (VarE 'value)
-                        ValidatableList _ t   -> seqV (getV (VarE 'value) (listF t)) vlvl
-                        ValidatableMaybe _ t  -> InfixE (Just $ InfixE (Just $ getV (VarE 'value) (AppT (ConT ''Maybe) t))
-                                                                       (VarE '(>>=))
-                                                                       (Just $ VarE 'id)
-                                                        )
-                                                        (VarE '(>>=))
-                                                        (Just $ InfixE (Just $ VarE 'return)
-                                                                       (VarE '(.))
-                                                                       (Just $ VarE 'validate)
-                                                        )
+                appValueExpQ :: Name -> (Name, Type) -> ExpQ
+                appValueExpQ vn (fn, ft) = do
+                    let sigV = [| $(varE vn) :: $(conT n') |]
+                    let sigF t = [| $(varE fn) :: $(conT n') -> F $(return t) |]
+                    let fListT t = AppT ListT (AppT (ConT ''F) t)
+                    let maybeT t = AppT (ConT ''Maybe) t
+                    case fieldTypeOf ft of
+                        NormalScalar t        -> [| value                ($(sigF t) $(sigV)) |]
+                        ValidatableScalar _ t -> [| (value >=> validate) ($(sigF t) $(sigV)) |]
+                        NormalList t          -> [| value                ($(sigF $ fListT t) $(sigV)) >>= sequence . map value |]
+                        ValidatableList _ t   -> [| value                ($(sigF $ fListT t) $(sigV)) >>= sequence . map (value >=> validate) |]
+                        ValidatableMaybe _ t  -> [| value                ($(sigF $ maybeT t) $(sigV)) >>= id >>= return . validate |]
 
                 -- Generates expression obtaining list of errors from a field.
                 -- f = (f1 :: A' -> F a) (v :: A')
                 -- errX :: F x -> Maybe [ValidationError]
                 -- errN (f :: F a) = (:[]) <$> (cause f)
-                -- errV (f :: F A') = errN f <|> errors <$> (value f)
+                -- errV (f :: F A') = errN f <|> errors (Proxy :: Proxy A) <$> (value f)
                 -- errNS (f :: F [F a]) = errN f <|> (value f >>= return . concat . catMaybes . map errN)
                 -- errVS (f :: F [F A']) = errN f <|> (value f >>= return . concat . catMaybes . map errV)
-                -- errMB (f :: F (Maybe A')) = errN f <|> (value f >>= id >>= return . errors)
+                -- errMB (f :: F (Maybe A')) = errN f <|> (value f >>= id >>= return . errors (Proxy :: Proxy A))
                 -- maybe [] id (errX f)
-                appCauseExp :: Name -> (Name, Type) -> Exp
-                appCauseExp vn (fn, ft) = AppE (AppE (AppE (VarE 'maybe) (ListE [])) (VarE 'id)) errX
-                    where
-                        errX =
-                            let sigV = SigE (VarE vn) (ConT n') -- (v :: A')
-                                sigF t = SigE (VarE fn) (AppT (AppT ArrowT (ConT n')) (AppT (ConT ''F) t)) -- t -> [| f1 :: A' -> F t |]
-                                getF t = AppE (sigF t) sigV -- (f1 :: A' -> F t) (v :: A')
-                                listF t = AppT ListT (AppT (ConT ''F) t) -- [F t]
-                                proxy t = SigE (ConE 'Proxy) (AppT (ConT ''Proxy) t)
-                                mapval f err = InfixE (Just $ AppE (VarE 'value) f)
-                                                    (VarE '(>>=))
-                                                    (Just $ InfixE (Just $ VarE 'return)
-                                                                    (VarE '(.))
-                                                                    (Just $ InfixE (Just $ VarE 'concat)
-                                                                                    (VarE '(.))
-                                                                                    (Just $ InfixE (Just $ VarE 'catMaybes)
-                                                                                                (VarE '(.))
-                                                                                                (Just $ AppE (VarE 'map) err)
-                                                                                    )
-                                                                    )
-                                                    )
-                                errN = let fn = mkName "f"
-                                    in LamE [VarP fn] $ InfixE (Just $ InfixE Nothing (ConE '(:)) (Just $ ListE []))
-                                                                (VarE '(<$>))
-                                                                (Just $ AppE (VarE 'cause) (VarE fn))
-                                errNF f = AppE errN f
-                                errV t = let fn = mkName "f"
-                                    in LamE [VarP fn] $ InfixE (Just $ errNF (VarE fn))
-                                                               (VarE '(<|>))
-                                                               (Just $ InfixE (Just $ AppE (VarE 'errors) (proxy t))
-                                                                              (VarE '(<$>))
-                                                                              (Just $ AppE (VarE 'value) (VarE fn))
-                                                               )
-                                errNS f = InfixE (Just $ errNF f) (VarE '(<|>)) (Just $ mapval f errN)
-                                errVS t f = InfixE (Just $ errNF f) (VarE '(<|>)) (Just $ mapval f (errV t))
-                            in case fieldTypeOf ft of
-                                NormalScalar t         -> errNF (getF t)
-                                ValidatableScalar t' t -> AppE (errV t') (getF t)
-                                NormalList t           -> errNS $ getF (listF t)
-                                ValidatableList t' t   -> errVS t' $ getF (listF t)
-                                ValidatableMaybe t' t  -> InfixE (Just $ errNF $ getF (AppT (ConT ''Maybe) t))
-                                                                 (VarE '(<|>))
-                                                                 (Just $ InfixE (Just $ InfixE (Just $ AppE (VarE 'value) (getF (AppT (ConT ''Maybe) t)))
-                                                                                               (VarE '(>>=))
-                                                                                               (Just $ VarE 'id)
-                                                                                )
-                                                                                (VarE '(>>=))
-                                                                                (Just $ InfixE (Just $ ConE 'Just)
-                                                                                               (VarE '(.))
-                                                                                               (Just $ AppE (VarE 'errors) (proxy t'))
-                                                                                )
-                                                                 )
+                appCauseExpQ :: Name -> (Name, Type) -> ExpQ
+                appCauseExpQ vn (fn, ft) = do
+                    let f t = [| ($(varE fn) :: $(conT n') -> F $(return t)) ($(varE vn) :: $(conT n')) |]
+                    let errN = [| (\f -> (:[]) <$> cause f) |]
+                    let errV t = [| (\f -> $(errN) f <|> (errors (Proxy :: Proxy $(return t)) <$> value f)) |]
+                    let fListT t = AppT ListT (AppT (ConT ''F) t)
+                    let errs = case fieldTypeOf ft of
+                            NormalScalar t         -> [| let f' = $(f t) in $(errN) f' |]
+                            ValidatableScalar t' t -> [| let f' = $(f t) in $(errV t') f' |]
+                            NormalList t           -> [| let f' = $(f $ fListT t) in $(errN) f' <|> (value f' >>= return . concat . catMaybes . map $(errN)) |]
+                            ValidatableList t' t   -> [| let f' = $(f $ fListT t) in $(errN) f' <|> (value f' >>= return . concat . catMaybes . map $(errV t')) |]
+                            ValidatableMaybe t' t  ->
+                                let mt = AppT (ConT ''Maybe) t
+                                in [| let f' = $(f mt) in $(errN) f' <|> (value f' >>= id >>= return . errors (Proxy :: Proxy $(return t'))) |]
+                    [| maybe [] id $(errs) |]
 
-                fs' :: Name -> [(Name, Type)] -> Exp
-                fs' vn fs =
-                    let fe fn t = SigE (VarE fn) (AppT (AppT ArrowT (ConT n')) (AppT (ConT ''F) t))
-                    in ListE $ map (\(f, ft) -> case isValidatable ft of
-                                                    Nothing -> AppE (VarE 'cause) (AppE (fe f ft) (VarE vn))
-                                                    Just t' -> AppE (VarE 'cause) (AppE (fe f t') (VarE vn))
-                                   ) fs
-
-                -- Generates body of @validate@ implementation by concatenating [| value (f1 v) |] expressions with (<*>).
-                --v' :: Name -> Exp -> [(Name, Type)] -> Exp
-                --v' vn acc [] = acc
-                --v' vn acc [f] = app acc (appValueExp f vn)
-                --v' vn acc (f:fs) = v' vn (app acc (appValueExp f vn)) fs
                 -- Generates data constructor by wrapping all types of fields with @F@.
-                con' :: Name -> Con -> Con
-                con' cn (RecC _ recs) = RecC cn (map (\(rn, bang, ft) -> (genFieldName rn, bang, fieldType ft)) recs)
+                constructorOf :: Name -> Con -> Con
+                constructorOf cn (RecC _ recs) = RecC cn (map (\(rn, bang, ft) -> (genFieldName rn, bang, fieldType ft)) recs)
                     where
                         fieldType t = case fieldTypeOf t of
-                                        NormalScalar t -> AppT (ConT ''F) t
+                                        NormalScalar t        -> AppT (ConT ''F) t
                                         ValidatableScalar _ t -> AppT (ConT ''F) t
-                                        NormalList t -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
-                                        ValidatableList _ t -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
-                                        ValidatableMaybe _ t -> AppT (ConT ''F) (AppT (ConT ''Maybe) t)
-                -- Obtains a type wrapped by @F@. Original type is returned when it is @Validatable@ type.
-                ft' :: Type -> Type
-                ft' t = maybe t id (isValidatable t)
-                -- Checks the type is @Validatable@ and returns its name if so.
-                -- A type is considered to be @Validatable@
-                -- only when its name is included in the argument of the same invocation of this function,
-                -- or it is the list (or Maybe applied type in future) of @Validatable@ type.
-                isValidatable :: Type -> Maybe Type
-                isValidatable t@(ConT n) = n `L.elemIndex` ns >> return (ConT $ genTypeName n)
-                isValidatable (AppT ListT t) = isValidatable t >>= Just . (AppT ListT)
-                isValidatable _ = Nothing
+                                        NormalList t          -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
+                                        ValidatableList _ t   -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
+                                        ValidatableMaybe _ t  -> AppT (ConT ''F) (AppT (ConT ''Maybe) t)
 
 data VerificationError = forall v. (Verifier v) => VerificationError (Proxy v) (FailureHint v)
 
@@ -459,8 +381,8 @@ type instance Apply (a ': as) f = a -> Apply as f
 
 -- | Declares an operator to extract arguments of @Verifier@ by applying a function which accepts them in the same order.
 --
--- This operator provides shorthand way to obtain @Verifier@ arguments as variables to make them available in @verify@ or @verificationFailure@.
--- See an example below which shows the generation of custom error message by using the @Verifier@ arguments.
+-- This operator provides shorthand way to obtain @Verifier@ arguments in @verify@ or @verificationFailure@.
+-- See an example below which shows the usage of @<-$@ in @verify@.
 --
 -- > data MinAppear (a :: Symbol) (b :: Nat)
 -- >
@@ -473,7 +395,7 @@ type instance Apply (a ': as) f = a -> Apply as f
 -- >                      )
 -- >
 -- >     verify _ v = 
--- >         let (target, minCount) = (,) <-$ verifierArgs proxy :: (String, Integer)
+-- >         let (target, minCount) = (,) <-$ verifierArgs (Proxy :: Proxy MinAppear) :: (String, Integer)
 -- >         in if minCount <= length (filter (== target) words v) then Right v else Left ()
 class ExtractArgs args r where
     (<-$) :: Apply args r -> Args args -> r
@@ -504,13 +426,18 @@ class FromJSONBetterErrors a where
 instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
     parseJSON = JB.toAesonParser (\e -> T.pack "Validation failed") fromJSONBetterErrors
 
+-- ----------------------------------------------------------------
+-- For JSON 
+-- ----------------------------------------------------------------
+
 {- | Generates declaration of function to parse given type in aeson-better-errors style.
 
     > data A = A { f1 :: String, f2 :: Maybe Int }
     > $(deriveBetterFromJSON ''A)
     >
     > instance FromJSONBetterErrors A where
-    >     fromJSONBetterErrors = A <$> key "f1" asString <*> keyMay "f2" asIntegral
+    >     fromJSONBetterErrors = A <$> asField (Proxy :: Proxy String) (KeyPointer "f1")
+    >                              <*> asField (Proxy :: Proxy Int) (KeyPointer "f2")
 -}
 deriveBetterFromJSON :: Name
                      -> Con
@@ -525,8 +452,13 @@ deriveBetterFromJSON n c@(RecC cn recs) = do
             recs <- mapM (\(rn, _, rt) -> [| asField (Proxy :: Proxy $(return rt)) (KeyPointer $ stripSuffix $ show rn) |]) rs
             return $ applicativeCon cn recs
 
+-- | Declares a method to get JSON parser by the type of a field.
+--
+-- Besides following instances, instance definition of every @Validatable@ type is generated by @validatable@.
 class AsType a where
-    asType :: Proxy a -> JB.Parse err a
+    -- | Returns JSON parser by a type.
+    asType :: Proxy a -- ^ Type specifier.
+           -> JB.Parse err a -- ^ JSON parser.
 
 instance AsType [Char] where
     asType _ = JB.asString
@@ -539,22 +471,32 @@ instance {-# OVERLAPPABLE #-} (AsType a) => AsType [a] where
 instance AsType Object where
     asType _ = JB.asObject
 
+-- | Declares a method to get JSON parser by the type and the pointer to value in current parsing state.
+--
+-- This method is used to generate the instance of @FromJSONBetterErrors@
+-- In the generated code, @Pointer@ given as second argument is always @KeyPointer@.
+-- Although, it can be @RawPointer@ when invoked from other instance implementation.
 class AsField a where
-    asField :: Proxy a -> Pointer -> JB.Parse err a
+    -- | Returns JSON parser for a field.
+    asField :: Proxy a -- ^ Type specifier for the field.
+            -> Pointer -- ^ Pointer indicating target value to parse in current state.
+            -> JB.Parse err a -- ^ JSON parser.
+
 instance {-# OVERLAPPABLE #-} (AsType a) => AsField a where
     asField p (KeyPointer n) = JB.key (T.pack n) (asType p)
     asField p RawPointer = asType p
+-- Without this instance, 'AsField [a]' has higher priority than '(AsType a) => AsField a'.
 instance {-# OVERLAPPING #-} AsField [Char] where
     asField p (KeyPointer n) = JB.key (T.pack n) (asType p)
     asField p RawPointer = asType p
 instance (AsType a) => AsField (Maybe a) where
     asField _ (KeyPointer n) = JB.keyOrDefault (T.pack n) Nothing (JB.perhaps $ asType (Proxy :: Proxy a))
+
 instance {-# OVERLAPS #-} (AsField a) => AsField [a] where
     -- FIXME index information is lost.
     asField _ (KeyPointer n) = JB.key (T.pack n) $ JB.eachInArray
                                                  $ asField (Proxy :: Proxy a) RawPointer
 instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
-    -- FIXME alternativeが適当。
     asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n
                     >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
 instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
@@ -575,6 +517,10 @@ instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
                     JB.ExpectedIntegral _ -> F Nothing Nothing source (Just $ TypeMismatch [n] (Proxy :: Proxy a))
                     _ -> F Nothing Nothing EmptyValidatable (Just $ ErrorString $ "unknown error")
 
+-- ----------------------------------------------------------------
+-- For HTTP form 
+-- ----------------------------------------------------------------
+
 deriveFromForm :: Name
                -> Con
                -> DecQ
@@ -587,29 +533,52 @@ deriveFromForm n c@(RecC cn recs) = do
             recs <- mapM (\(rn, _, rt) -> [| asFormField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) f |]) rs
             return $ applicativeCon cn recs
 
-class AsFormField a where
-    asFormField :: Proxy a -> String -> Form -> Either T.Text a
+--deriveFromForm :: Name
+--               -> Con
+--               -> DecQ
+--deriveFromForm n c = do
+--    ds <- [d|
+--        instance FromForm $(conT n) where
+--            fromForm f = case J.fromJSON (jsonifyForm f) of
+--                J.Error e -> Left (T.pack e)
+--                J.Success v -> Right v
+--        |]
+--    return $ ds !! 0
 
-instance  FromHttpApiData Object where
-    parseUrlPiece _ = Left $ T.pack "Json object type can not be applied to form data"
+-- | Declares a method to parse HTTP form into field value.
+class AsFormField a where
+    -- | Parses a value in a form into field value of type @a@.
+    asFormField :: Proxy a -- ^ Type specifier.
+                -> String -- ^ Form key.
+                -> Form -- ^ HTTP form.
+                -> Either T.Text a -- ^ Parsed value or error message.
+
+jsonifyForm :: F.Form
+            -> J.Value
+jsonifyForm = J.object . map toPair . toList
+    where
+        toPair :: (T.Text, T.Text) -> (T.Text, J.Value)
+        toPair (k, v) = (k, J.String v)
+
+instance FromHttpApiData Object where
+    parseUrlPiece _ = Left $ T.pack "Json object type can not be parsed by form data"
 
 instance {-# OVERLAPPABLE #-} (FromHttpApiData a) => AsFormField a where
     asFormField _ n f = F.parseUnique (T.pack n) f
---instance (FromHttpApiData a) => AsFormField [a] where
---    asFormField _ n f = F.parseAll (T.pack n) f
 instance {-# OVERLAPPING #-} AsFormField String where
     asFormField _ n f = F.parseUnique (T.pack n) f
-instance {-# OVERLAPS #-} (FromHttpApiData a) => AsFormField (Maybe a) where
-    asFormField _ n f = F.parseMaybe (T.pack n) f
--- FIXME: list field always fails
-instance {-# OVERLAPPING #-} (AsFormField a) => AsFormField (F [F a]) where
-    asFormField _ _ _ = Left $ T.pack "Nested type is not available as a form field"
--- FIXME: maybe field always fails
-instance {-# OVERLAPPING #-} AsFormField (F (Maybe a)) where
-    asFormField _ _ _ = Left $ T.pack "Nested type is not available as a form field"
-instance {-# OVERLAPPABLE #-} (FromHttpApiData a) => AsFormField [F a] where
-    asFormField _ n f = (F.parseAll (T.pack n) f :: Either T.Text [a])
-                            >>= return . map (\v -> F (Just v) Nothing EmptyValidatable Nothing)
+
+instance {-# OVERLAPS #-} (AsFormField a) => AsFormField (Maybe a) where
+    asFormField _ n f = F.lookupMaybe (T.pack n) f >>= \v' -> 
+        case v' of
+            Nothing -> return Nothing
+            Just v -> Just <$> asFormField (Proxy :: Proxy a) n f
+
+instance {-# OVERLAPS #-} (AsFormField a) => AsFormField [F a] where
+    asFormField _ n f = mapM (\p -> asFormField (Proxy :: Proxy (F a)) n $ F.toForm [(n, p)]) params
+        where
+            params = F.lookupAll (T.pack n) f
+
 instance {-# OVERLAPPABLE #-} (AsFormField a) => AsFormField (F a) where
     asFormField _ n f = asFormField (Proxy :: Proxy (F (a :? '[]))) n f
                             >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
@@ -621,6 +590,10 @@ instance {-# OVERLAPPABLE #-} (AsFormField a, AllVerifiable vs a) => AsFormField
                                     Left (VerificationError pv h) -> F Nothing Nothing EmptyValidatable (Just $ VerificationFailure [KeyPointer n] pv h)
                                     Right v' -> F (Just $ SafeData v' pvs) Nothing EmptyValidatable Nothing
                         Left e -> F Nothing Nothing EmptyValidatable (Just $ ErrorString $ T.unpack e)
+
+-- ----------------------------------------------------------------
+-- Helper functions
+-- ----------------------------------------------------------------
 
 -- | Generate an expression applying data constructo to expressions concatenated by @<*>@.
 --

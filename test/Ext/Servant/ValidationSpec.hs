@@ -50,7 +50,7 @@ spec = do
                 Right v -> do
                     value (f11 v) `shouldBe` Just "test"
                     value (f12 v) `shouldBe` Nothing
-                    cause (f12 v) `shouldBe` Just (TypeMismatch [KeyPointer "f12"] (Proxy :: Proxy Int))
+                    cause (f12 v) `shouldBe` Just (TypeMismatch (Proxy :: Proxy Int))
                     value (f13 v) `shouldBe` Just True
 
     describe "validation of Maybes" $ do
@@ -72,4 +72,4 @@ spec = do
                 Right v -> do
                     value (f21 v) `shouldBe` Just (Just "test")
                     value (f22 v) `shouldBe` Nothing
-                    cause (f22 v) `shouldBe` Just (TypeMismatch [KeyPointer "f22"] (Proxy :: Proxy (Maybe Int)))
+                    cause (f22 v) `shouldBe` Just (TypeMismatch (Proxy :: Proxy (Maybe Int)))

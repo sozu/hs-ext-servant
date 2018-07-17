@@ -34,6 +34,10 @@ import Data.Aeson.Types
 import Web.FormUrlEncoded as F
 import Web.HttpApiData
 
+-- ----------------------------------------------------------------
+-- Types and functions used in validation
+-- ----------------------------------------------------------------
+
 -- | This type indicates the location of parsing value in data source.
 data Pointer = RawPointer
              | IndexPointer Int
@@ -42,15 +46,16 @@ data Pointer = RawPointer
 
 type PointerPath = [Pointer]
 
-instance {-# OVERLAPPING #-} Show PointerPath where
-    showsPrec 10 [] = showString "(root)"
-    showsPrec 10 (RawPointer : []) = showString "(root)"
-    showsPrec 10 (IndexPointer i : ps) = \s -> "[" ++ show i ++ "]" ++ showsPrec 9 ps s
-    showsPrec 10 (KeyPointer k : ps) = \s -> k ++ showsPrec 9 ps s
-    showsPrec d [] = showString $ ""
-    showsPrec d (RawPointer:ps) = showsPrec d ps
-    showsPrec d (IndexPointer i:ps) = \s -> "[" ++ show i ++ "]" ++ showsPrec d ps s
-    showsPrec d (KeyPointer k:ps) = \s -> "." ++ k ++ showsPrec d ps s
+showPath :: PointerPath
+         -> Bool
+         -> String
+showPath [] True = "(root)"
+showPath [] False = ""
+showPath (RawPointer : ps) True = showPath ps True
+showPath (RawPointer : ps) False = showPath ps False
+showPath (IndexPointer i : ps) _ = "[" ++ show i ++ "]" ++ showPath ps False
+showPath (KeyPointer k : ps) True = k ++ showPath ps False
+showPath (KeyPointer k : ps) False = "." ++ k ++ showPath ps False
 
 -- | Data source from which each field value is assigned.
 --
@@ -80,58 +85,66 @@ instance ToSource T.Text where
     toSource = TextValidatable
 
 -- | Declares types of causes for validation errors.
-data ValidationError = ErrorString String
-                     | ValueMissing PointerPath
-                     | forall t. TypeMismatch PointerPath (Proxy t)
-                     | forall v. (Verifier v) => VerificationFailure PointerPath (Proxy v) (FailureHint v)
+data ValidationError' = ErrorString String
+                      | ValueMissing
+                      | forall t. TypeMismatch (Proxy t)
+                      | forall v. (Verifier v) => VerificationFailure (Proxy v) (FailureHint v)
 
-instance Eq ValidationError where
+instance Show ValidationError' where
+    show (ErrorString s) = s
+    show (ValueMissing) = "Value is not found"
+    show (TypeMismatch _) = "Value is not convertible"
+    show (VerificationFailure v hint) = "Invalid value"
+
+instance Eq ValidationError' where
     ErrorString s1 == ErrorString s2 = s1 == s2
-    ValueMissing p1 == ValueMissing p2 = p1 == p2
-    TypeMismatch p1 _ == TypeMismatch p2 _ = p1 == p2
-    VerificationFailure p1 v1 _ == VerificationFailure p2 v2 _ = p1 == p2 && eqVerifier v1 v2
+    ValueMissing == ValueMissing = True
+    TypeMismatch _ == TypeMismatch _ = True
+    VerificationFailure v1 _ == VerificationFailure v2 _ = eqVerifier v1 v2
     _ == _ = False
 
+data ValidationError = ValidationError PointerPath ValidationError' deriving (Eq)
+
+(!@) :: PointerPath
+     -> ValidationError'
+     -> ValidationError
+(!@) path e = ValidationError path e
+
 instance Show ValidationError where
-    show (ErrorString s) = s
-    show (ValueMissing ps) = "Value is not found at " ++ show ps
-    show (TypeMismatch ps _) = "Value at " ++ show ps ++ " is not convertible"
-    show (VerificationFailure ps v hint) = verificationFailure v ps hint
+    show (ValidationError path err) = "[" ++ showPath path True ++ "] "
+            ++ case err of
+                ErrorString s -> s
+                ValueMissing -> "Value is not found"
+                TypeMismatch _ -> "Value is not convertible"
+                VerificationFailure v hint -> verificationFailure v path hint
 
 -- | Wrapper of @a@ holding the value or error cause according to the validation result of a field.
 data F a = F { value :: Maybe a
-             , alternative :: Maybe a
              , source :: Source
-             , cause :: Maybe ValidationError
-             } deriving (Show, Generic)
+             , cause :: Maybe ValidationError'
+             } deriving (Generic)
 
--- | Instances of @Validatable@ supplies way to convert from some data source to valid object of @a@.
--- @v@ is a data type which can hold values enough to construct @a@ object,
--- and errors happened in conversion from data source to each field of @a@.
--- @validatable ''A@, which is a TH function, generates another type @A'@ which implements @Validatable A' A@.
-class Validatable v a where
+-- | Instances of @Validatable@ supplies way to convert from some data source to valid object of @ValidationTarget v@.
+--
+-- @v@ is a data type which can hold values enough to construct @ValidationTarget v@ object,
+-- and errors happened in conversion from data source to each field of @ValidationTarget v@.
+-- @validatable ''A@ generates another type @A'@ which implements @Validatable A'@ with @ValidationTarget A' = A@.
+class Validatable v where
+    type ValidationTarget v :: *
+
     -- | Returns valid object of @a@ if the validation succeeded.
     validate :: v -- ^ Object holding field values of @a@ and validation errors.
-             -> Maybe a -- ^ @Just a@ if validation succeeded, otherwise Nothing.
+             -> Maybe (ValidationTarget v) -- ^ @Just a@ if validation succeeded, otherwise Nothing.
 
     -- | Returns a list of validation errors.
-    errors :: Proxy a -- ^ Proxy to determine which instance to be used.
+    errors :: PointerPath -- ^ Base path indexing the location of this value.
            -> v -- ^ Object holding field values of @a@ and validation errors.
            -> [ValidationError] -- ^ List of validation errors.
 
--- | Same as @errors@ but TypeApplication is available instead of @Proxy@.
---
--- > data A = ...
--- > instance Validatable A' A where
--- >     ...
--- > v :: A'
--- > v = ...
--- >
--- > errors (Proxy :: Proxy A) v == errors @A v
-errorsOf :: forall a v. (Validatable v a)
-         => v -- ^ Object holding field values of @a@ and validation errors.
-         -> [ValidationError] -- ^ List of validation errors.
-errorsOf v = errors (Proxy :: Proxy a) v
+errorsOf :: (Validatable v)
+         => v
+         -> [ValidationError]
+errorsOf v = errors [] v
 
 jsonOptions = defaultOptions { J.fieldLabelModifier = stripSuffix, J.omitNothingFields = True }
 formOptions = defaultFormOptions { F.fieldLabelModifier = stripSuffix }
@@ -147,6 +160,10 @@ data FieldType = NormalScalar Type
                | ValidatableScalar Type Type
                | ValidatableList Type Type
                | ValidatableMaybe Type Type
+
+-- ----------------------------------------------------------------
+-- TH function to generate types used in validation.
+-- ----------------------------------------------------------------
 
 {- | Declares new data type which has equivalent fields to given type.
 
@@ -195,13 +212,15 @@ data FieldType = NormalScalar Type
     > instance AsFormField B' where
     >     ...
     >
-    > instance Validatable A' A where
+    > instance Validatable A' where
+    >      type ValidationTarget A' = A
     >      validate v = A <$> ...
-    >      errors _ v = ...
+    >      errors p v = ...
     >
-    > instance Validatable B' B where
+    > instance Validatable B' where
+    >      type ValidationTarget B' = B
     >      validate v = B <$> ...
-    >      errors _ v = ...
+    >      errors p v = ...
 
     TODO: should generate instance of FromHttpApiData instead of FromForm ?
 -}
@@ -214,13 +233,15 @@ validatable ns = concat <$> mapM conv ns
             TyConI (DataD _ _ tvs kind (c@(RecC cn recs):_) drvs) <- reify name
             let fields = map (\(rn, _, rt) -> (genFieldName rn, rt)) recs
             let vn = mkName "v"
+            let pn = mkName "p"
             let c' = constructorOf n' c
             dJson <- deriveBetterFromJSON n' c'
             dForm <- deriveFromForm n' c'
             dValidatable <- [d|
-                    instance Validatable $(conT n') $(conT name) where
+                    instance Validatable $(conT n') where
+                        type ValidationTarget $(conT n') = $(conT name)
                         validate $(varP vn) = $(validateFor cn vn fields)
-                        errors _ $(varP vn) = $(errorsFor vn fields)
+                        errors $(varP pn) $(varP vn) = $(errorsFor pn vn fields)
                 |]
             dParse <- [d|
                     instance AsType $(conT n') where
@@ -264,8 +285,8 @@ validatable ns = concat <$> mapM conv ns
                 validateFor cn vn fields = applicativeCon cn <$> (mapM (appValueExpQ vn) fields)
 
                 -- Generates an implementation of @errors@
-                errorsFor :: Name -> [(Name, Type)] -> ExpQ
-                errorsFor vn fields = appE (varE 'concat) (listE $ map (appCauseExpQ vn) fields)
+                errorsFor :: Name -> Name -> [(Name, Type)] -> ExpQ
+                errorsFor pn vn fields = appE (varE 'concat) (listE $ map (appCauseExpQ pn vn) fields)
 
                 -- Generates expression obtaining valid data from a field.
                 -- Normal type:              [| value                ((f1 :: A' -> F String)     (v :: A')) |]
@@ -289,26 +310,40 @@ validatable ns = concat <$> mapM conv ns
                 -- Generates expression obtaining list of errors from a field.
                 -- f = (f1 :: A' -> F a) (v :: A')
                 -- errX :: F x -> Maybe [ValidationError]
-                -- errN (f :: F a) = (:[]) <$> (cause f)
-                -- errV (f :: F A') = errN f <|> errors (Proxy :: Proxy A) <$> (value f)
-                -- errNS (f :: F [F a]) = errN f <|> (value f >>= return . concat . catMaybes . map errN)
-                -- errVS (f :: F [F A']) = errN f <|> (value f >>= return . concat . catMaybes . map errV)
-                -- errMB (f :: F (Maybe A')) = errN f <|> (value f >>= id >>= return . errors (Proxy :: Proxy A))
+                -- errN p (f :: F a) = (:[]) <$> (p !@) <$> (cause f)
+                -- errV p (f :: F A') = errN p f <|> errors p <$> (value f)
+                -- errI p (i, f) err = err (p ++ [IndexPointer i]) f
+                -- errNS p (f :: F [F a]) = errN p f <|> (value f >>= return . concat . catMaybes . map errNI . zip [0..])
+                -- errVS p (f :: F [F A']) = errN p f <|> (value f >>= return . concat . catMaybes . map errVI . zip [0..])
+                -- errMB p (f :: F (Maybe A')) = errN p f <|> (value f >>= id >>= return . errors p)
                 -- maybe [] id (errX f)
-                appCauseExpQ :: Name -> (Name, Type) -> ExpQ
-                appCauseExpQ vn (fn, ft) = do
+                appCauseExpQ :: Name -> Name -> (Name, Type) -> ExpQ
+                appCauseExpQ pn vn (fn, ft) = do
                     let f t = [| ($(varE fn) :: $(conT n') -> F $(return t)) ($(varE vn) :: $(conT n')) |]
-                    let errN = [| (\f -> (:[]) <$> cause f) |]
-                    let errV t = [| (\f -> $(errN) f <|> (errors (Proxy :: Proxy $(return t)) <$> value f)) |]
+                    let errN = [| (\p f -> (:[]) . (p !@) <$> cause f) |]
+                    let errV t = [| (\p f -> $(errN) p f <|> (errors p <$> value f)) |]
+                    let errI p err = map (\(i, f) -> err (p ++ [IndexPointer i]) f) . zip [0..]
                     let fListT t = AppT ListT (AppT (ConT ''F) t)
+                    let path = [| $(varE pn) ++ [KeyPointer $ stripSuffix (nameBase fn)] |]
                     let errs = case fieldTypeOf ft of
-                            NormalScalar t         -> [| let f' = $(f t) in $(errN) f' |]
-                            ValidatableScalar t' t -> [| let f' = $(f t) in $(errV t') f' |]
-                            NormalList t           -> [| let f' = $(f $ fListT t) in $(errN) f' <|> (value f' >>= return . concat . catMaybes . map $(errN)) |]
-                            ValidatableList t' t   -> [| let f' = $(f $ fListT t) in $(errN) f' <|> (value f' >>= return . concat . catMaybes . map $(errV t')) |]
-                            ValidatableMaybe t' t  ->
-                                let mt = AppT (ConT ''Maybe) t
-                                in [| let f' = $(f mt) in $(errN) f' <|> (value f' >>= id >>= return . errors (Proxy :: Proxy $(return t'))) |]
+                            NormalScalar t         -> [| let f' = $(f t) in $(errN) $(path) f' |]
+                            ValidatableScalar t' t -> [| let f' = $(f t) in $(errV t') $(path) f' |]
+                            NormalList t           -> [|
+                                    let f' = $(f $ fListT t)
+                                    in $(errN) $(path) f' <|> (value f' >>=
+                                            return . concat . catMaybes . map (\(i, f) -> $(errN) ($(path) ++ [IndexPointer i]) f) . zip [0..]
+                                        )
+                                |]
+                            ValidatableList t' t   -> [|
+                                    let f' = $(f $ fListT t)
+                                    in $(errN) $(path) f' <|> (value f' >>=
+                                            return . concat . catMaybes . map (\(i, f) -> $(errV t') ($(path) ++ [IndexPointer i]) f) . zip [0..]
+                                        )
+                                |]
+                            ValidatableMaybe t' t  -> let mt = AppT (ConT ''Maybe) t in [|
+                                    let f' = $(f mt)
+                                    in $(errN) $(path) f' <|> (value f' >>= id >>= return . errors $(path))
+                                |]
                     [| maybe [] id $(errs) |]
 
                 -- Generates data constructor by wrapping all types of fields with @F@.
@@ -322,7 +357,9 @@ validatable ns = concat <$> mapM conv ns
                                         ValidatableList _ t   -> AppT (ConT ''F) (AppT ListT (AppT (ConT ''F) t))
                                         ValidatableMaybe _ t  -> AppT (ConT ''F) (AppT (ConT ''Maybe) t)
 
-data VerificationError = forall v. (Verifier v) => VerificationError (Proxy v) (FailureHint v)
+-- ----------------------------------------------------------------
+-- Verifiers
+-- ----------------------------------------------------------------
 
 -- | Instances should provide a verification with @v@ which determines the given @a@ is valid or not.
 --
@@ -345,16 +382,16 @@ class (Eq (Args (VerifierSpec v))) => Verifier v where
 
     verify' :: Proxy v
             -> (VerifiableType v)
-            -> Either VerificationError (VerifiableType v)
+            -> Either ValidationError' (VerifiableType v)
     verify' p v = case verify p v of
-                    Left h -> Left $ VerificationError p h
+                    Left h -> Left $ VerificationFailure p h
                     Right v' -> Right v'
 
     verificationFailure :: Proxy v
                         -> [Pointer]
                         -> FailureHint v
                         -> String
-    verificationFailure _ ps hint = "Value at " ++ show ps ++ " is invalid"
+    verificationFailure _ ps hint = "Value at " ++ showPath ps True ++ " is invalid"
 
 class EqVerifier v1 v2 where
     eqVerifier :: Proxy v1 -> Proxy v2 -> Bool
@@ -405,40 +442,39 @@ instance ExtractArgs '[] r where
 instance (ExtractArgs as r) => ExtractArgs (a ': as) r where
     (<-$) f (a `ACons` as) = f a <-$ as
 
+-- | Type operator to qualifying a type with verifiers.
 data (:?) a (vs :: [*]) = SafeData a (Proxy vs)
 
+instance (Eq a) => Eq (a :? vs) where
+    (==) (SafeData a1 _) (SafeData a2 _) = a1 == a2
+instance (Show a) => Show (a :? vs) where
+    show (SafeData a _) = show a
+
+-- | Returns verified value.
 safeData :: (a :? vs)
          -> a
 safeData (SafeData v _) = v
 
 class AllVerifiable (vs :: [*]) a where
-    verifyAll :: Proxy vs -> a -> Either VerificationError a
+    verifyAll :: Proxy vs -> a -> Either ValidationError' a
 
 instance AllVerifiable '[] a where
     verifyAll _ a = Right a
-
 instance (Verifier v, VerifiableType v ~ a, AllVerifiable vs a) => AllVerifiable (v ': vs) a where
     verifyAll _ a = verify' (Proxy :: Proxy v) a >>= verifyAll (Proxy :: Proxy vs)
-
-class FromJSONBetterErrors a where
-    fromJSONBetterErrors :: JB.Parse err a
-
-instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
-    parseJSON = JB.toAesonParser (\e -> T.pack "Validation failed") fromJSONBetterErrors
 
 -- ----------------------------------------------------------------
 -- For JSON 
 -- ----------------------------------------------------------------
 
-{- | Generates declaration of function to parse given type in aeson-better-errors style.
-
-    > data A = A { f1 :: String, f2 :: Maybe Int }
-    > $(deriveBetterFromJSON ''A)
-    >
-    > instance FromJSONBetterErrors A where
-    >     fromJSONBetterErrors = A <$> asField (Proxy :: Proxy String) (KeyPointer "f1")
-    >                              <*> asField (Proxy :: Proxy Int) (KeyPointer "f2")
--}
+-- | Generates declaration of function to parse given type in aeson-better-errors style.
+--
+--  > data A = A { f1 :: String, f2 :: Maybe Int }
+--  > $(deriveBetterFromJSON ''A)
+--  >
+--  > instance FromJSONBetterErrors A where
+--  >     fromJSONBetterErrors = A <$> asField (Proxy :: Proxy String) (KeyPointer "f1")
+--  >                              <*> asField (Proxy :: Proxy (Maybe Int)) (KeyPointer "f2")
 deriveBetterFromJSON :: Name
                      -> Con
                      -> DecQ
@@ -451,6 +487,12 @@ deriveBetterFromJSON n c@(RecC cn recs) = do
         asFields cn rs = do
             recs <- mapM (\(rn, _, rt) -> [| asField (Proxy :: Proxy $(return rt)) (KeyPointer $ stripSuffix $ show rn) |]) rs
             return $ applicativeCon cn recs
+
+class FromJSONBetterErrors a where
+    fromJSONBetterErrors :: JB.Parse err a
+
+instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
+    parseJSON = JB.toAesonParser (\e -> T.pack "Validation failed") fromJSONBetterErrors
 
 -- | Declares a method to get JSON parser by the type of a field.
 --
@@ -498,29 +540,37 @@ instance {-# OVERLAPS #-} (AsField a) => AsField [a] where
                                                  $ asField (Proxy :: Proxy a) RawPointer
 instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
     asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n
-                    >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
+                    >>= \(F v s e) -> return (F (v >>= return . safeData) s e)
 instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
     asField _ n = do
         let pvs = Proxy :: Proxy vs
         source <- JB.asValue >>= return . toSource
         (asField (Proxy :: Proxy a) n >>= \v -> do
                 return $ case verifyAll pvs v of
-                    Left (VerificationError pv h) -> F Nothing Nothing source (Just $ VerificationFailure [n] pv h)
-                    Right v' -> F (Just $ SafeData v' pvs) Nothing source Nothing
+                    Left e -> F Nothing source (Just e)
+                    Right v' -> F (Just $ SafeData v' pvs) source Nothing
          ) `catchError` \e -> return $ case e of
-                JB.InvalidJSON s -> F Nothing Nothing (StringValidatable s) (Just $ ErrorString "invalid JSON string")
+                JB.InvalidJSON s -> F Nothing (StringValidatable s) (Just $ ErrorString "invalid JSON string")
                 JB.BadSchema _ es -> case es of
-                    JB.KeyMissing _ -> F Nothing Nothing source (Just $ ValueMissing [n])
-                    JB.WrongType _ v -> F Nothing Nothing source (Just $ TypeMismatch [n] (Proxy :: Proxy a))
-                    JB.FromAeson s -> F Nothing Nothing source (Just $ ErrorString s)
-                    JB.OutOfBounds _ -> F Nothing Nothing source (Just $ TypeMismatch [n] (Proxy :: Proxy a))
-                    JB.ExpectedIntegral _ -> F Nothing Nothing source (Just $ TypeMismatch [n] (Proxy :: Proxy a))
-                    _ -> F Nothing Nothing EmptyValidatable (Just $ ErrorString $ "unknown error")
+                    JB.KeyMissing _ -> F Nothing source (Just $ ValueMissing)
+                    JB.WrongType _ v -> F Nothing source (Just $ TypeMismatch (Proxy :: Proxy a))
+                    JB.FromAeson s -> F Nothing source (Just $ ErrorString s)
+                    JB.OutOfBounds _ -> F Nothing source (Just $ TypeMismatch (Proxy :: Proxy a))
+                    JB.ExpectedIntegral _ -> F Nothing source (Just $ TypeMismatch (Proxy :: Proxy a))
+                    _ -> F Nothing EmptyValidatable (Just $ ErrorString $ "unknown error")
 
 -- ----------------------------------------------------------------
 -- For HTTP form 
 -- ----------------------------------------------------------------
 
+-- | Generates instance of @FromForm@ for given type.
+--
+--  > data A = A { f1 :: String, f2 :: Maybe Int }
+--  > $(deriveFromForm ''A)
+--  >
+--  > instance FromForm A where
+--  >     fromForm f = A <$> asFormField (Proxy :: Proxy String) "f1" f
+--  >                    <*> asFormField (Proxy :: Proxy (Maybe Int)) "f2" f
 deriveFromForm :: Name
                -> Con
                -> DecQ
@@ -533,18 +583,6 @@ deriveFromForm n c@(RecC cn recs) = do
             recs <- mapM (\(rn, _, rt) -> [| asFormField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) f |]) rs
             return $ applicativeCon cn recs
 
---deriveFromForm :: Name
---               -> Con
---               -> DecQ
---deriveFromForm n c = do
---    ds <- [d|
---        instance FromForm $(conT n) where
---            fromForm f = case J.fromJSON (jsonifyForm f) of
---                J.Error e -> Left (T.pack e)
---                J.Success v -> Right v
---        |]
---    return $ ds !! 0
-
 -- | Declares a method to parse HTTP form into field value.
 class AsFormField a where
     -- | Parses a value in a form into field value of type @a@.
@@ -552,13 +590,6 @@ class AsFormField a where
                 -> String -- ^ Form key.
                 -> Form -- ^ HTTP form.
                 -> Either T.Text a -- ^ Parsed value or error message.
-
-jsonifyForm :: F.Form
-            -> J.Value
-jsonifyForm = J.object . map toPair . toList
-    where
-        toPair :: (T.Text, T.Text) -> (T.Text, J.Value)
-        toPair (k, v) = (k, J.String v)
 
 instance FromHttpApiData Object where
     parseUrlPiece _ = Left $ T.pack "Json object type can not be parsed by form data"
@@ -574,22 +605,23 @@ instance {-# OVERLAPS #-} (AsFormField a) => AsFormField (Maybe a) where
             Nothing -> return Nothing
             Just v -> Just <$> asFormField (Proxy :: Proxy a) n f
 
-instance {-# OVERLAPS #-} (AsFormField a) => AsFormField [F a] where
-    asFormField _ n f = mapM (\p -> asFormField (Proxy :: Proxy (F a)) n $ F.toForm [(n, p)]) params
+instance {-# OVERLAPS #-} (AsFormField a) => AsFormField [a] where
+    -- FIXME index information is lost.
+    asFormField _ n f = mapM (\p -> asFormField (Proxy :: Proxy a) n $ F.toForm [(n, p)]) params
         where
             params = F.lookupAll (T.pack n) f
 
 instance {-# OVERLAPPABLE #-} (AsFormField a) => AsFormField (F a) where
     asFormField _ n f = asFormField (Proxy :: Proxy (F (a :? '[]))) n f
-                            >>= \(F v a s e) -> return (F (v >>= return . safeData) Nothing s e)
+                            >>= \(F v s e) -> return (F (v >>= return . safeData) s e)
 instance {-# OVERLAPPABLE #-} (AsFormField a, AllVerifiable vs a) => AsFormField (F (a :? vs)) where
     asFormField _ n f =
         let pvs = Proxy :: Proxy vs
         in return $ case asFormField (Proxy :: Proxy a) n f of
                         Right v -> case verifyAll pvs v of
-                                    Left (VerificationError pv h) -> F Nothing Nothing EmptyValidatable (Just $ VerificationFailure [KeyPointer n] pv h)
-                                    Right v' -> F (Just $ SafeData v' pvs) Nothing EmptyValidatable Nothing
-                        Left e -> F Nothing Nothing EmptyValidatable (Just $ ErrorString $ T.unpack e)
+                                    Left e -> F Nothing EmptyValidatable (Just e)
+                                    Right v' -> F (Just $ SafeData v' pvs) EmptyValidatable Nothing
+                        Left e -> F Nothing EmptyValidatable (Just $ ErrorString $ T.unpack e)
 
 -- ----------------------------------------------------------------
 -- Helper functions

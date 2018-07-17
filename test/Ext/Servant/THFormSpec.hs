@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Ext.Servant.THFormSpec where
 
@@ -56,14 +57,14 @@ spec = do
                 Right r' -> validate r' `shouldBe` Just (ForStrList ["abc", "def", "ghi"])
                 Left e -> expectationFailure (T.unpack e)
 
-    describe "validation of validatable field" $ do
+    describe "validation of validatable field from HTTP form must fail" $ do
         it "valid" $ do
             let r = fromForm $ toForm [("val", "1")] :: Either T.Text ForVal'
             case r of
                 Right r' -> validate r' `shouldBe` (Nothing :: Maybe ForVal)
                 Left e -> expectationFailure (T.unpack e)
 
-    describe "validation of validatable list field" $ do
+    describe "validation of validatable list field from HTTP form must fail" $ do
         it "valid" $ do
             let r = fromForm $ toForm [ ("vallist", "1")
                                       , ("vallist", "2")

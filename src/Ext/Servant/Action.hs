@@ -32,19 +32,21 @@ import Data.Resource
 
 type Action = IO
 
+-- | Converts @Action@ to @Handler@ to be applied to @hoistServerWithContext@ like below.
+--
+-- > let rs = hoistServerWithContext (Proxy :: Proxy ResourceAPI)
+-- >                                 contextTypes
+-- >                                 (actionHandler resources)
+-- >                                 resourceServer
+--
+-- This function also provides logging function to @Handler@ monad by means of give resources.
 actionHandler :: (GetContextLogger rs)
               => Resources rs
               -> Action a
               -> Handler a
---actionHandler resources action = liftIO $ do
--- runInBase :: Handler a -> IO (Either ServantErr a)
 actionHandler resources action = control $ \runInBase -> do
-    --let name = actionName action
     contexts <- generateContexts @'[] resources
     $(logQD' "Ext.Servant") contexts $ "Start action"
-    --r <- action `catchAny` \e -> do
-    --    $(logQE' "Ext.Servant") contexts $ "Exception in action: " ++ show e
-    --    throw e
     r <- (Right <$> action) `E.catches` [ E.Handler $ \e@(ServantErr _ _ _  _) -> do
                                             $(logQE' "Ext.Servant") contexts $ "Error in action: " ++ show e
                                             runInBase $ throwError e

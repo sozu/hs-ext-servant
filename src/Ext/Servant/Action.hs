@@ -27,8 +27,11 @@ import Control.Monad.Base
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Control
 import qualified Control.Exception.Safe as E
+import Servant.API.ContentTypes (AllMime)
 import Servant.Server
 import Data.Resource
+import Ext.Servant.Context
+import Ext.Servant.Validation
 
 type Action = IO
 
@@ -56,3 +59,21 @@ actionHandler resources action = control $ \runInBase -> do
                                         ]
     $(logQD' "Ext.Servant") contexts $ "Complete action"
     return $ r
+
+-- | Validates @v@ and returns value of @ValidationTarget v@ if it succeeds, otherwise throws custom error.
+--
+-- You have to give the instance implementation of @[ValidationError]@ for @Errorneous@ in some module.
+-- If no implementation are found, the compilation of source code using this function fails.
+validateOr400 :: forall m v ks cs. (
+                   E.MonadThrow m
+                 , Validatable v
+                 , Erroneous [ValidationError]
+                 , AllMime (ErroneousTypes [ValidationError])
+                 )
+              => RequestContext ks cs -- ^ Request context.
+              -> v -- ^ Validatable object.
+              -> m (ValidationTarget v) -- ^ Unrapped value if validation succeeds.
+validateOr400 rc v = do
+    case validate v of
+        Nothing -> E.throw $ errorFor err400 (errorsOf v) rc
+        Just v' -> return v'

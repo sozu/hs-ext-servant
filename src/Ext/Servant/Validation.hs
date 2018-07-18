@@ -133,17 +133,18 @@ class Validatable v where
     type ValidationTarget v :: *
 
     -- | Returns valid object of @a@ if the validation succeeded.
-    validate :: v -- ^ Object holding field values of @a@ and validation errors.
-             -> Maybe (ValidationTarget v) -- ^ @Just a@ if validation succeeded, otherwise Nothing.
+    validate :: v -- ^ Object holding field values of @ValidationTarget v@ and validation errors.
+             -> Maybe (ValidationTarget v) -- ^ @Just (ValidationTarget v)@ if validation succeeded, otherwise Nothing.
 
     -- | Returns a list of validation errors.
     errors :: PointerPath -- ^ Base path indexing the location of this value.
-           -> v -- ^ Object holding field values of @a@ and validation errors.
+           -> v -- ^ Object holding field values of @ValidationTarget v@ and validation errors.
            -> [ValidationError] -- ^ List of validation errors.
 
+-- | Returns a list of validation errors each of which has pointer path from root.
 errorsOf :: (Validatable v)
-         => v
-         -> [ValidationError]
+         => v -- ^ Object holding field values of @ValidationTarget v@ and validation errors.
+         -> [ValidationError] -- ^ List of validation errors.
 errorsOf v = errors [] v
 
 jsonOptions = defaultOptions { J.fieldLabelModifier = stripSuffix, J.omitNothingFields = True }

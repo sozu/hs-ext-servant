@@ -25,6 +25,14 @@ instance FromJSONBetterErrors V2 where
     fromJSONBetterErrors = V2 <$> asField (Proxy :: Proxy (F (Maybe String))) (KeyPointer "f21")
                               <*> asField (Proxy :: Proxy (F (Maybe Int))) (KeyPointer "f22")
 
+data V3 = V3 { f31 :: F [F String]
+             , f32 :: F [F Int]
+             }
+
+instance FromJSONBetterErrors V3 where
+    fromJSONBetterErrors = V3 <$> asField (Proxy :: Proxy (F [F String])) (KeyPointer "f31")
+                              <*> asField (Proxy :: Proxy (F [F Int])) (KeyPointer "f32")
+
 spec :: Spec
 spec = do
     describe "validation of primitive types" $ do
@@ -73,3 +81,25 @@ spec = do
                     value (f21 v) `shouldBe` Just (Just "test")
                     value (f22 v) `shouldBe` Nothing
                     cause (f22 v) `shouldBe` Just (TypeMismatch (Proxy :: Proxy (Maybe Int)))
+
+    describe "validation of lists" $ do
+        it "valid" $ do
+            let res = parse (fromJSONBetterErrors :: Parse' V3) $ "{\
+                        \ \"f31\": [\"abc\", \"def\"], \
+                        \ \"f32\": [12, 34] \
+                        \ }"
+            case res of
+                Right v -> do
+                    (>>= return . map value) (value $ f31 v) `shouldBe` Just [Just "abc", Just "def"]
+                    (>>= return . map value) (value $ f32 v) `shouldBe` Just [Just 12, Just 34]
+
+        it "invalid integer" $ do
+            let res = parse (fromJSONBetterErrors :: Parse' V3) $ "{\
+                        \ \"f31\": [\"abc\", \"def\"], \
+                        \ \"f32\": [12, \"invalid\"] \
+                        \ }"
+            case res of
+                Right v -> do
+                    (>>= return . map value) (value $ f31 v) `shouldBe` Just [Just "abc", Just "def"]
+                    (>>= return . map value) (value $ f32 v) `shouldBe` Just [Just 12, Nothing]
+                    (>>= return . map cause) (value $ f32 v) `shouldBe` Just [Nothing, Just (TypeMismatch (Proxy :: Proxy Int))]

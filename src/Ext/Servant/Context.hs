@@ -63,16 +63,35 @@ import Debug.Trace
 -}
 data RequestContext ks cs = RequestContext Request (Contexts cs) (Keys ks)
 
--- | Throwable error type to be rendered according to media type specified by Accept header.
+-- | Custom error to be rendered according to media type specified by Accept header.
+--
+-- To use custom error response,
+--
+-- 1. Declare data type holding error information.
+-- 2. Make the type an instance of @Errorneous@. 
+-- 3. Throw @ServantErr@ built via @errorFor@ with the custom error as @e@ in your @Handler@s.
 class Erroneous e where
+    -- | List of media types. The custom error is used only when Accept header specifies one of these types.
     type ErroneousTypes e :: [*]
-    buildError :: ServantErr -> e -> MediaType -> ServantErr
 
+    -- | Generates @ServantErr@ by customizing base @ServantErr@ object with the information of custome error.
+    --
+    -- The implementation of this method should change @errBody@ of given @ServantErr@ according to media type
+    -- to represent the error information in custom error.
+    buildError :: ServantErr -- ^ Base @ServantErr@ object.
+               -> e -- ^ Custom error.
+               -> MediaType -- ^ Media type to determine the format of response body.
+               -> ServantErr -- ^ Customized @ServantErr@ object.
+
+-- | Generates @ServantErr@ containing custom error information.
+--
+-- This function is designed to be invoked in @Handler@s.
+-- Its convenient to set first argument to @ServantErr@ created by functions such as err400, err500.
 errorFor :: forall e ks cs. (Erroneous e, AllMime (ErroneousTypes e))
-         => ServantErr
-         -> e
-         -> RequestContext ks cs
-         -> ServantErr
+         => ServantErr -- ^ Base @ServantErr@ object.
+         -> e -- ^ Custom error.
+         -> RequestContext ks cs -- ^ Request context of this invocation.
+         -> ServantErr -- ^ Customized @ServantErr@ object to be thrown.
 errorFor org e rc = maybe org (buildError org e) mt
     where
         mt = lookup hAccept (requestHeaders $ requestOf rc)

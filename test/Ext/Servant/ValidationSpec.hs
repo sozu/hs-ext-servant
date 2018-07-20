@@ -37,7 +37,7 @@ spec :: Spec
 spec = do
     describe "validation of primitive types" $ do
         it "valid" $ do
-            let res = parse (fromJSONBetterErrors :: Parse' V1) $ "{\
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V1) $ "{\
                         \ \"f11\": \"test\", \
                         \ \"f12\": 12, \
                         \ \"f13\": true \
@@ -47,9 +47,10 @@ spec = do
                     value (f11 v) `shouldBe` Just "test"
                     value (f12 v) `shouldBe` Just 12
                     value (f13 v) `shouldBe` Just True
+                Left e -> expectationFailure (show e)
 
         it "invalid integer" $ do
-            let res = parse (fromJSONBetterErrors :: Parse' V1) $ "{\
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V1) $ "{\
                         \ \"f11\": \"test\", \
                         \ \"f12\": \"abc\", \
                         \ \"f13\": true \
@@ -60,19 +61,21 @@ spec = do
                     value (f12 v) `shouldBe` Nothing
                     cause (f12 v) `shouldBe` Just (TypeMismatch (Proxy :: Proxy Int))
                     value (f13 v) `shouldBe` Just True
+                Left e -> expectationFailure (show e)
 
     describe "validation of Maybes" $ do
         it "valid" $ do
-            let res = parse (fromJSONBetterErrors :: Parse' V2) $ "{\
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V2) $ "{\
                         \ \"f21\": \"test\" \
                         \ }"
             case res of
                 Right v -> do
                     value (f21 v) `shouldBe` Just (Just "test")
                     value (f22 v) `shouldBe` Just Nothing
+                Left e -> expectationFailure (show e)
 
         it "invalid interger" $ do
-            let res = parse (fromJSONBetterErrors :: Parse' V2) $ "{\
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V2) $ "{\
                         \ \"f21\": \"test\", \
                         \ \"f22\": \"abc\" \
                         \ }"
@@ -81,10 +84,11 @@ spec = do
                     value (f21 v) `shouldBe` Just (Just "test")
                     value (f22 v) `shouldBe` Nothing
                     cause (f22 v) `shouldBe` Just (TypeMismatch (Proxy :: Proxy (Maybe Int)))
+                Left e -> expectationFailure (show e)
 
     describe "validation of lists" $ do
         it "valid" $ do
-            let res = parse (fromJSONBetterErrors :: Parse' V3) $ "{\
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V3) $ "{\
                         \ \"f31\": [\"abc\", \"def\"], \
                         \ \"f32\": [12, 34] \
                         \ }"
@@ -92,9 +96,10 @@ spec = do
                 Right v -> do
                     (>>= return . map value) (value $ f31 v) `shouldBe` Just [Just "abc", Just "def"]
                     (>>= return . map value) (value $ f32 v) `shouldBe` Just [Just 12, Just 34]
+                Left e -> expectationFailure (show e)
 
         it "invalid integer" $ do
-            let res = parse (fromJSONBetterErrors :: Parse' V3) $ "{\
+            let res = parse (fromJSONBetterErrors :: Parse ValidationError' V3) $ "{\
                         \ \"f31\": [\"abc\", \"def\"], \
                         \ \"f32\": [12, \"invalid\"] \
                         \ }"
@@ -103,3 +108,4 @@ spec = do
                     (>>= return . map value) (value $ f31 v) `shouldBe` Just [Just "abc", Just "def"]
                     (>>= return . map value) (value $ f32 v) `shouldBe` Just [Just 12, Nothing]
                     (>>= return . map cause) (value $ f32 v) `shouldBe` Just [Nothing, Just (TypeMismatch (Proxy :: Proxy Int))]
+                Left e -> expectationFailure (show e)

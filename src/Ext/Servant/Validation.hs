@@ -20,7 +20,7 @@ import GHC.Exts (toList)
 import GHC.Generics
 import Control.Applicative
 import Control.Monad
-import Control.Monad.Except (catchError)
+import Control.Monad.Except (catchError, throwError)
 import Data.Proxy
 import qualified Data.ByteString.Lazy as B
 import qualified Data.Map as M
@@ -28,6 +28,7 @@ import qualified Data.List as L
 import Language.Haskell.TH
 import qualified Data.Text as T
 import Data.Maybe (maybe, catMaybes)
+import Data.Either (either)
 import Data.Aeson as J
 import qualified Data.Aeson.BetterErrors as JB
 import Data.Aeson.Types
@@ -248,7 +249,8 @@ validatable ns = concat <$> mapM conv ns
                     instance AsType $(conT n') where
                         asType _ = fromJSONBetterErrors
                     instance AsFormField $(conT n') where
-                        asFormField _ _ _ = Left $ T.pack "Nested type is not available as a form field."
+                        --asFormField _ _ _ = Left $ T.pack "Nested type is not available as a form field."
+                        asFormField _ _ _ = Left $ ErrorString "Nested type is not available as a form field."
                 |]
             return $ concat [[
                 DataD [] n' [] Nothing [constructorOf n' c] [DerivClause Nothing [(ConT ''Generic)]]
@@ -456,6 +458,20 @@ safeData :: (a :? vs)
          -> a
 safeData (SafeData v _) = v
 
+class SafeAccess f t a where
+    (.!) :: (f -> t)
+         -> f
+         -> a
+
+infixl 2 .!
+
+instance {-# OVERLAPPABLE #-} SafeAccess f a a where
+    (.!) k v = k v
+instance {-# OVERLAPS #-} SafeAccess f (a :? vs) a where
+    (.!) k v = safeData $ k v
+instance {-# OVERLAPPING #-} (Functor t) => SafeAccess f (t (a :? vs)) (t a) where
+    (.!) k v = safeData <$> k v
+
 class AllVerifiable (vs :: [*]) a where
     verifyAll :: Proxy vs -> a -> Either ValidationError' a
 
@@ -490,10 +506,10 @@ deriveBetterFromJSON n c@(RecC cn recs) = do
             return $ applicativeCon cn recs
 
 class FromJSONBetterErrors a where
-    fromJSONBetterErrors :: JB.Parse err a
+    fromJSONBetterErrors :: JB.Parse ValidationError' a
 
 instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
-    parseJSON = JB.toAesonParser (\e -> T.pack "Validation failed") fromJSONBetterErrors
+    parseJSON = JB.toAesonParser (\e -> T.pack $ show e) fromJSONBetterErrors
 
 -- | Declares a method to get JSON parser by the type of a field.
 --
@@ -501,7 +517,7 @@ instance {-# OVERLAPPABLE #-} (FromJSONBetterErrors a) => FromJSON a where
 class AsType a where
     -- | Returns JSON parser by a type.
     asType :: Proxy a -- ^ Type specifier.
-           -> JB.Parse err a -- ^ JSON parser.
+           -> JB.Parse ValidationError' a -- ^ JSON parser.
 
 instance AsType [Char] where
     asType _ = JB.asString
@@ -523,7 +539,7 @@ class AsField a where
     -- | Returns JSON parser for a field.
     asField :: Proxy a -- ^ Type specifier for the field.
             -> Pointer -- ^ Pointer indicating target value to parse in current state.
-            -> JB.Parse err a -- ^ JSON parser.
+            -> JB.Parse ValidationError' a -- ^ JSON parser.
 
 instance {-# OVERLAPPABLE #-} (AsType a) => AsField a where
     asField p (KeyPointer n) = JB.key (T.pack n) (asType p)
@@ -532,33 +548,36 @@ instance {-# OVERLAPPABLE #-} (AsType a) => AsField a where
 instance {-# OVERLAPPING #-} AsField [Char] where
     asField p (KeyPointer n) = JB.key (T.pack n) (asType p)
     asField p RawPointer = asType p
-instance (AsType a) => AsField (Maybe a) where
-    asField _ (KeyPointer n) = JB.keyOrDefault (T.pack n) Nothing (JB.perhaps $ asType (Proxy :: Proxy a))
+instance (AsField a) => AsField (Maybe a) where
+    asField _ (KeyPointer n) = JB.keyOrDefault (T.pack n)
+                                               Nothing
+                                               (JB.perhaps $ asField (Proxy :: Proxy a) RawPointer)
+
+instance {-# OVERLAPS #-} (AsField a, AllVerifiable vs a) => AsField (a :? vs) where
+    asField _ n = do
+        source <- JB.asValue >>= return . toSource
+        asField (Proxy :: Proxy a) n >>= \v -> do
+                case verifyAll (Proxy :: Proxy vs) v of
+                    Left e -> JB.throwCustomError e
+                    Right v' -> return $ SafeData v' (Proxy :: Proxy vs)
 
 instance {-# OVERLAPS #-} (AsField a) => AsField [a] where
     -- FIXME index information is lost.
     asField _ (KeyPointer n) = JB.key (T.pack n) $ JB.eachInArray
                                                  $ asField (Proxy :: Proxy a) RawPointer
 instance {-# OVERLAPPABLE #-} (AsField a) => AsField (F a) where
-    asField _ n = asField (Proxy :: Proxy (F (a :? '[]))) n
-                    >>= \(F v s e) -> return (F (v >>= return . safeData) s e)
-instance (AsField a, AllVerifiable vs a) => AsField (F (a :? vs)) where
     asField _ n = do
-        let pvs = Proxy :: Proxy vs
         source <- JB.asValue >>= return . toSource
-        (asField (Proxy :: Proxy a) n >>= \v -> do
-                return $ case verifyAll pvs v of
-                    Left e -> F Nothing source (Just e)
-                    Right v' -> F (Just $ SafeData v' pvs) source Nothing
-         ) `catchError` \e -> return $ case e of
-                JB.InvalidJSON s -> F Nothing (StringValidatable s) (Just $ ErrorString "invalid JSON string")
+        (asField (Proxy :: Proxy a) n >>= \v' -> return (F (Just v') source Nothing))
+            `catchError` \e -> return $ case e of
+                JB.InvalidJSON s -> F Nothing (StringValidatable s) (Just $ ErrorString "invalid JSON format")
                 JB.BadSchema _ es -> case es of
+                    JB.CustomError ve -> F Nothing source (Just $ ve)
                     JB.KeyMissing _ -> F Nothing source (Just $ ValueMissing)
                     JB.WrongType _ v -> F Nothing source (Just $ TypeMismatch (Proxy :: Proxy a))
                     JB.FromAeson s -> F Nothing source (Just $ ErrorString s)
                     JB.OutOfBounds _ -> F Nothing source (Just $ TypeMismatch (Proxy :: Proxy a))
                     JB.ExpectedIntegral _ -> F Nothing source (Just $ TypeMismatch (Proxy :: Proxy a))
-                    _ -> F Nothing EmptyValidatable (Just $ ErrorString $ "unknown error")
 
 -- ----------------------------------------------------------------
 -- For HTTP form 
@@ -581,7 +600,7 @@ deriveFromForm n c@(RecC cn recs) = do
     where
         asFields :: Name -> [(Name, Bang, Type)] -> ExpQ
         asFields cn rs = do
-            recs <- mapM (\(rn, _, rt) -> [| asFormField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) f |]) rs
+            recs <- mapM (\(rn, _, rt) -> [| vett' (asFormField (Proxy :: Proxy $(return rt)) (stripSuffix $ show rn) f) |]) rs
             return $ applicativeCon cn recs
 
 -- | Declares a method to parse HTTP form into field value.
@@ -590,18 +609,33 @@ class AsFormField a where
     asFormField :: Proxy a -- ^ Type specifier.
                 -> String -- ^ Form key.
                 -> Form -- ^ HTTP form.
-                -> Either T.Text a -- ^ Parsed value or error message.
+                -> Either ValidationError' a -- ^ Parsed value or error message.
 
 instance FromHttpApiData Object where
     parseUrlPiece _ = Left $ T.pack "Json object type can not be parsed by form data"
 
+ttve' :: Either T.Text a
+      -> Either ValidationError' a
+ttve' lr = either (Left . ErrorString . T.unpack) return lr
+
+vett' :: Either ValidationError' a
+      -> Either T.Text a
+vett' lr = either (Left . T.pack . show) return lr
+
 instance {-# OVERLAPPABLE #-} (FromHttpApiData a) => AsFormField a where
-    asFormField _ n f = F.parseUnique (T.pack n) f
+    asFormField _ n f = ttve' $ F.parseUnique (T.pack n) f
 instance {-# OVERLAPPING #-} AsFormField String where
-    asFormField _ n f = F.parseUnique (T.pack n) f
+    asFormField _ n f = ttve' $ F.parseUnique (T.pack n) f
+
+instance {-# OVERLAPS #-} (AsFormField a, AllVerifiable vs a) => AsFormField (a :? vs) where
+    asFormField _ n f = case asFormField (Proxy :: Proxy a) n f of
+            Right v -> case verifyAll (Proxy :: Proxy vs) v of
+                        Right v' -> Right $ SafeData v (Proxy :: Proxy vs)
+                        Left e -> Left e
+            Left e -> Left e
 
 instance {-# OVERLAPS #-} (AsFormField a) => AsFormField (Maybe a) where
-    asFormField _ n f = F.lookupMaybe (T.pack n) f >>= \v' -> 
+    asFormField _ n f = ttve' (F.lookupMaybe (T.pack n) f) >>= \v' -> 
         case v' of
             Nothing -> return Nothing
             Just v -> Just <$> asFormField (Proxy :: Proxy a) n f
@@ -613,16 +647,9 @@ instance {-# OVERLAPS #-} (AsFormField a) => AsFormField [a] where
             params = F.lookupAll (T.pack n) f
 
 instance {-# OVERLAPPABLE #-} (AsFormField a) => AsFormField (F a) where
-    asFormField _ n f = asFormField (Proxy :: Proxy (F (a :? '[]))) n f
-                            >>= \(F v s e) -> return (F (v >>= return . safeData) s e)
-instance {-# OVERLAPPABLE #-} (AsFormField a, AllVerifiable vs a) => AsFormField (F (a :? vs)) where
-    asFormField _ n f =
-        let pvs = Proxy :: Proxy vs
-        in return $ case asFormField (Proxy :: Proxy a) n f of
-                        Right v -> case verifyAll pvs v of
+    asFormField _ n f = return $ case asFormField (Proxy :: Proxy a) n f of
+                                    Right v -> F (Just v) EmptyValidatable Nothing
                                     Left e -> F Nothing EmptyValidatable (Just e)
-                                    Right v' -> F (Just $ SafeData v' pvs) EmptyValidatable Nothing
-                        Left e -> F Nothing EmptyValidatable (Just $ ErrorString $ T.unpack e)
 
 -- ----------------------------------------------------------------
 -- Helper functions

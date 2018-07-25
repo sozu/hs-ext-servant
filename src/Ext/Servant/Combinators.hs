@@ -20,6 +20,7 @@ import qualified Data.List as L
 import Data.String
 import qualified Data.ByteString as B
 import Network.Wai
+import Network.HTTP.Types
 import Servant.API
 import Servant.Server
 import Servant.Server.Internal.RoutingApplication
@@ -27,6 +28,21 @@ import Servant.Server.Internal.RoutingApplication
 -- | A combinator to allow cross domain access for specified HTTP methods.
 data CrossDomain (methods :: [StdMethod])
 
+-- | @CrossDomain@ combinator requires the object of this type exist in @Context@ of the application.
+--
+-- The value of @getOrigin@ should be a domain URL included in HTTP response header with key of 'Access-Control-Allow-Origin'.
+-- Because the domain depends on where the application runs, it should be determined at runtime for example by reading configuration file,
+-- not at compilation time like HTTP methods configured as promoted types.
+--
+-- > let origin = CrossDomainOrigin "http://127.0.0.1"
+-- > Warp.run 8001 $ resourceApp (Proxy :: Proxy API)
+-- >                             resources
+-- >                             (Proxy :: Proxy '[])
+-- >                             (origin :. EmptyContext)
+-- >                             $ hoistServerWithContext (Proxy :: Proxy API)
+-- >                                                      (Proxy :: Proxy '[CrossDomainOrigin])
+-- >                                                      (actionHandler resources)
+-- >                                                      server
 newtype CrossDomainOrigin = CrossDomainOrigin { getOrigin :: String }
 
 instance ( HasServer api context
@@ -35,13 +51,26 @@ instance ( HasServer api context
          ) => HasServer (CrossDomain methods :> api) context where
     type ServerT (CrossDomain methods :> api) m = ServerT api m
 
-    route p context (Delayed {..}) = tweakResponse (fmap addCrossDomain) $ route (Proxy :: Proxy api) context (Delayed { .. })
+    route p context (Delayed {..}) = tweakResponse (fmap addCrossDomain) $ rescueOptions <$> route (Proxy :: Proxy api) context (Delayed {..})
         where
             origin' :: B.ByteString
             origin' = fromString $ getOrigin (getContextEntry context :: CrossDomainOrigin)
 
             methods' :: B.ByteString
             methods' = fromString $ L.intercalate "," $ showMethods (Proxy :: Proxy methods)
+
+            rescueOptions :: RoutingApplication
+                          -> RoutingApplication
+            rescueOptions app = \req res ->
+                if requestMethod req == methodOptions
+                    then app req (respond' res) 
+                    else app req res
+                where
+                    respond' :: (RouteResult Response -> IO ResponseReceived)
+                             -> (RouteResult Response -> IO ResponseReceived)
+                    respond' res = \rr -> case rr of
+                        Fail (ServantErr 405 _ _ _ ) -> res $ Route $ responseLBS ok200 [] ""
+                        _ -> res rr
 
             addCrossDomain :: Response -> Response
             addCrossDomain = mapResponseHeaders ((("Access-Control-Allow-Origin", origin') :) . (("Access-Control-Allow-Methods", methods') :))

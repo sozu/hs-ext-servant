@@ -80,12 +80,12 @@ unIO' c = let (# _, v #) = unIO c realWorld# in v
     This function generates type implementing @MimeRender@ for each HTML template.
 
     @tmpl@ generates code which compiles template at compile time.
-    > instance MimeRender [TemplateName] where
+    > instance MimeRender [TemplateName] [arg_type] where
     >     mimeRender _ it = fromString $(render path)
 
     @tmpld@ implements @MimeRender@ to compile template for each time @mimeRender@ is invoked.
     > cache_[TemplateName] = unsafePerformIO $ newIORef Nothing
-    > instance MimeRender [TemplateName] where
+    > instance MimeRender [TemplateName] [arg_type] where
     >     mimeRender _ it = fromString
     >                           $ unsafePerformIO
     >                           $ renderRuntime path [import_list] (it, "it", [arg_type]) cache_[TemplateName]
@@ -115,7 +115,15 @@ declareTemplate n path t statically = do
                                                       []]
                              , [noinline, cache]
                              )
-    mime <- instanceD (cxt []) (appT (appT (conT ''MimeRender) (conT n)) (getType t)) [mr]
+    --mime <- instanceD (cxt []) (appT (appT (conT ''MimeRender) (conT n)) (getType t)) [mr]
+    -- Instance declaration uses type variable like
+    -- > instance (a ~ ArgType) => MimeRender TemplateName a where
+    -- >     ...
+    -- because direct instantiation of ArgType can cause "Illegal type synonym family application in instance" error.
+    -- Use of the type variable brings the restriction that no other instances can be declared for the template.
+    -- Is this restriction allowable? Maybe so because one template should be written to render variable on just one type.
+    let alias = mkName "a"
+    mime <- instanceD (cxt [appT (appT equalityT (varT alias)) (getType t)]) (appT (appT (conT ''MimeRender) (conT n)) (varT alias)) [mr]
     let bs v = Just (appE (varE 'C8.pack) (litE $ stringL v))
     let ct = funD 'contentType [clause [wildP] (normalB (infixE (bs "text") (varE '(//)) (bs "html"))) []]
     accept <- instanceD (cxt []) (appT (conT ''Accept) (conT n)) [ct]

@@ -39,6 +39,7 @@ dependencies:
 - servant-foreign
 - servant-server
 - wai
+- warp
 - aeson
 - aeson-better-errors
 - monad-logger
@@ -46,6 +47,7 @@ dependencies:
 - vault
 - hs-resource
 - hs-template
+- hs-validation
 
 library:
   source-dirs: src

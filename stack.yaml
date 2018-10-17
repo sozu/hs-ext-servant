@@ -42,6 +42,7 @@ packages:
 extra-deps:
 - hs-resource
 - hs-template
+- hs-validation
 
 # Override default flag values for local packages and extra-deps
 # flags: {}

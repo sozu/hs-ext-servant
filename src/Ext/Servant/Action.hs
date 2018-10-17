@@ -30,8 +30,8 @@ import qualified Control.Exception.Safe as E
 import Servant.API.ContentTypes (AllMime)
 import Servant.Server
 import Data.Resource
+import Data.Validation
 import Ext.Servant.Context
-import Ext.Servant.Validation
 
 type Action = IO
 

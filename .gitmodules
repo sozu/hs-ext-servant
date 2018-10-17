@@ -4,3 +4,6 @@
 [submodule "hs-resource"]
 	path = hs-resource
 	url = https://github.com/sozu/hs-resource.git
+[submodule "hs-validation"]
+	path = hs-validation
+	url = https://github.com/sozu/hs-validation.git

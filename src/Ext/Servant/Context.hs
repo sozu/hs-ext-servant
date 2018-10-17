@@ -279,10 +279,6 @@ instance {-# OVERLAPPABLE #-} (MonadBaseControl IO m) => WrapHandler (m a) ks rs
                 writeIORef cref ?cxt
                 runInBase $ h (RequestContext r ?cxt keys)
 
--- RunInBase m b = forall a. m a -> b (StM m a)
--- liftBaseWith :: (RunInBase m b -> b a) -> m a
--- restoreM :: StM m a -> m a
-
 instance {-# OVERLAPPING #-} (WrapHandler a ks rs, WrapHandler b ks rs) => WrapHandler (a :<|> b) ks rs where
     --wrapHandler :: Proxy rs -> Proxy ks -> Context context -> Request -> (RequestContext ks (Refs cs) -> (a :<|> b)) -> (a :<|> b)
     wrapHandler pr pk context r h = wrapHandler pr pk context r (lhs . h) :<|> wrapHandler pr pk context r (rhs . h)

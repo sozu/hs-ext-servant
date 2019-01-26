@@ -25,14 +25,14 @@ import Data.Proxy
 import Data.Maybe (fromJust, maybe)
 import Data.IORef
 import Control.Monad.IO.Class
-import Control.Monad.Reader
-import Control.Monad.State
+import Control.Monad.Except
 import Control.Monad.Trans
 import Control.Monad.Trans.Control
 import Control.Monad.Logger
 import Control.Exception.Safe hiding (Handler)
 import qualified Data.Vault.Lazy as V
 import qualified Data.ByteString.Lazy as B
+import Data.Functor.Identity
 import Data.String
 import Network.Wai
 import Network.HTTP.Media
@@ -261,23 +261,15 @@ class WrapHandler h (ks :: [*]) (rs :: [*]) where
                 -> (RequestContext ks (Refs cs) -> h) -- ^ Downstream handler.
                 -> h -- ^ Wrapped handler.
 
-instance {-# OVERLAPPABLE #-} (MonadBaseControl IO m) => WrapHandler (m a) ks rs where
+instance {-# OVERLAPPABLE #-} (MonadBaseControl IO m, SelectContexts (Refs cs)( Refs cs) (Refs cs), cs ~ ContextTypes (Refs rs)) => WrapHandler (m a) ks rs where
     wrapHandler _ _ context r h = (liftBaseWith $ \runInBase -> do
             let (RequestContextEntry resources key) = getContextEntry context :: RequestContextEntry ks rs
-            fst <$> withContext @(ContextTypes (Refs rs)) resources (execute r key h runInBase)
-        ) >>= restoreM
-        where
-            execute :: (With cs, cs ~ ContextTypes (Refs rs))
-                    => Request
-                    -> V.Key (RequestContextKeys ks rs)
-                    -> (RequestContext ks (Refs cs) -> m a)
-                    -> RunInBase m IO
-                    -> IO (StM m a)
-            execute r key h runInBase = do
-                let rck@(RequestContextKeys ckey keys) = fromJust $ V.lookup key (vault r)
-                let cref = fromJust $ V.lookup ckey (vault r)
-                writeIORef cref ?cxt
+                rck@(RequestContextKeys ckey keys) = fromJust $ V.lookup key (vault r)
+                cref = fromJust $ V.lookup ckey (vault r)
+            contexts <- readIORef cref
+            withContext' @(ContextTypes (Refs rs)) contexts $ do
                 runInBase $ h (RequestContext r ?cxt keys)
+        ) >>= restoreM
 
 instance {-# OVERLAPPING #-} (WrapHandler a ks rs, WrapHandler b ks rs) => WrapHandler (a :<|> b) ks rs where
     --wrapHandler :: Proxy rs -> Proxy ks -> Context context -> Request -> (RequestContext ks (Refs cs) -> (a :<|> b)) -> (a :<|> b)
@@ -294,11 +286,18 @@ instance ( WrapHandler (Server api) ks rs
          , ContextResources (Refs cs) (Refs rs)) => HasServer ((@>) (rs :: [*]) (ks :: [*]) :> api) context where
     type ServerT ((@>) rs ks :> api) m = RequestContext ks (R2C rs) -> ServerT api m
 
-    route p context (Delayed {..}) = route (Proxy :: Proxy api) context delayed'
+    route p context (Delayed {..}) = genContext <$> route (Proxy :: Proxy api) context delayed'
         where
+            genContext :: RoutingApplication -> RoutingApplication
+            genContext a = \r f -> do
+                let (RequestContextEntry resources key) = getContextEntry context :: RequestContextEntry ks rs
+                withContext' @(ContextTypes (Refs rs)) resources $ do
+                    let rck@(RequestContextKeys ckey _) = fromJust $ V.lookup key (vault r)
+                    let cref = fromJust $ V.lookup ckey (vault r)
+                    writeIORef cref ?cxt
+                    liftIO $ a r f
             serverD' c p h a b r = wrapHandler (Proxy :: Proxy rs) (Proxy :: Proxy ks) context r <$> serverD c p h a b r
             delayed' = Delayed { serverD = serverD'
-                               --, bodyD = \ct -> (,) <$> bodyD ct <*> return ct
                                , ..
                                }
 
@@ -379,6 +378,11 @@ class (HandlerFilter f) => FilterHandler f h where
                   -> Apply (FilterArgs f) h -- ^ Downstream handler.
                   -> h -- ^ Wrapped handler.
 
+    errorHandler :: ServantErr
+                 -> f
+                 -> Apply (FilterArgs f) h
+                 -> h
+
 instance {-# OVERLAPPABLE #-} (HandlerFilter f) => FilterHandler f (Handler a) where
     filterHandler filter r key h = do
         case V.lookup key (vault r) of
@@ -386,8 +390,10 @@ instance {-# OVERLAPPABLE #-} (HandlerFilter f) => FilterHandler f (Handler a) w
                 let cref = fromJust $ V.lookup ckey (vault r)
                 cxt <- liftIO $ readIORef cref
                 let ?cxt = selectContexts @(Refs (ContextsForFilter f)) cxt cxt
-                doFilter filter (RequestContext r ?cxt keys) h
+                doFilter filter (RequestContext r ?cxt keys) h `catch` \(e :: ServantErr) -> throwError e
             Nothing -> fail "No resource context found in request"
+
+    errorHandler e f h = throwError e
 
 instance {-# OVERLAPPING #-} (
             HandlerFilter f
@@ -399,9 +405,17 @@ instance {-# OVERLAPPING #-} (
         let (ha :<|> hb) = distribute h
         in filterHandler filter r key ha :<|> filterHandler filter r key hb
 
+    errorHandler e f h = 
+        let (ha :<|> hb) = distribute h
+        in errorHandler e f ha :<|> errorHandler e f hb
+
 instance {-# OVERLAPPING #-} (HandlerFilter f, FilterHandler f b, FilterOnFunc (FilterArgs f)) => FilterHandler f ((->) a b) where
     -- filterHandler :: f -> Request -> V.Key (RequestContextKeys (KeysForFilter f) rs) -> Apply (FilterArgs f) (a -> b) -> (a -> b)
     filterHandler filter r key h = \a -> filterHandler filter r key (h' a)
+        where
+            h' = filterOnFunc (Proxy :: Proxy (FilterArgs f)) (Proxy :: Proxy b) h
+
+    errorHandler e f h = \a -> errorHandler e f (h' a)
         where
             h' = filterOnFunc (Proxy :: Proxy (FilterArgs f)) (Proxy :: Proxy b) h
 
@@ -444,7 +458,10 @@ instance ( FilterHandler f (ServerT api Handler)
             serverD' c p h a b r = do
                 let filter = getContextEntry context :: f
                 let (RequestContextEntry resources key) = getContextEntry context :: RequestContextEntry (KeysForFilter f) (ResourcesInContext context)
-                serverD c p h a b r >>= \h -> Route (filterHandler filter r key h)
+                serverD c p h a b r >>= \h -> do
+                    return $ case runExcept $ lift $ Identity $ filterHandler filter r key h of
+                        Right h' -> h'
+                        Left e -> errorHandler e filter h
 
     -- hoistServerWithContext :: Proxy (Filter f :> api) -> Proxy context -> (m x -> n x) -> ServerT (Filter f :> api) m -> ServerT (Filter f :> api) n
     -- s :: ServerT (Filter f :> api) m

@@ -52,9 +52,11 @@ actionHandler resources action = control $ \runInBase -> do
     $(logQD' "Ext.Servant") contexts $ "Start action"
     r <- (Right <$> action) `E.catches` [ E.Handler $ \e@(ServantErr _ _ _  _) -> do
                                             $(logQE' "Ext.Servant") contexts $ "Error in action: " ++ show e
+                                            failAll e contexts
                                             runInBase $ throwError e
                                         , E.Handler $ \(e :: E.SomeException) -> do
                                             $(logQE' "Ext.Servant") contexts $ "Unexpected exception in action: " ++ show e
+                                            failAll e contexts
                                             E.throw e
                                         ]
     $(logQD' "Ext.Servant") contexts $ "Complete action"

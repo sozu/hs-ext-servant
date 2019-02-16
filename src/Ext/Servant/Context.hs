@@ -161,8 +161,11 @@ prepareVault :: Keys ks -- ^ Keys for values to insert into a vault.
 prepareVault KNil v = return v
 prepareVault (k `KCons` ks) v = newIORef undefined >>= \ref -> prepareVault ks (V.insert k ref v)
 
+data ContextsHolder rs = NoContexts
+                       | ContextsHolder (Contexts (R2C rs))
+
 -- | This data type holds keys for underlying values of @RequestContext@.
-data RequestContextKeys ks rs = RequestContextKeys (V.Key (IORef (Contexts (R2C rs)))) (Keys ks)
+data RequestContextKeys ks rs = RequestContextKeys (V.Key (IORef (ContextsHolder rs))) (Keys ks)
 
 -- | This instance declaration enables to apply @withContext@ to @RequestContext@ directly.
 instance (SelectContexts (Refs ds) cs cs) => WithContext ds (RequestContext ks cs) where
@@ -226,8 +229,8 @@ resourceApp :: forall api rs ks context. (HasServer api (RequestContextEntry ks 
 resourceApp p resources pks cxt = \a -> 
     \r h -> do
         -- Prepare vault space for resource contexts.
-        ckey <- V.newKey @(IORef (Contexts (R2C rs)))
-        cref <- newIORef undefined
+        ckey <- V.newKey @(IORef (ContextsHolder rs))
+        cref <- newIORef NoContexts
         let r1 = r { vault = V.insert ckey cref (vault r) }
 
         -- Prepare vault spaces for other keyed values.
@@ -266,8 +269,8 @@ instance {-# OVERLAPPABLE #-} (MonadBaseControl IO m, SelectContexts (Refs cs)( 
             let (RequestContextEntry resources key) = getContextEntry context :: RequestContextEntry ks rs
                 rck@(RequestContextKeys ckey keys) = fromJust $ V.lookup key (vault r)
                 cref = fromJust $ V.lookup ckey (vault r)
-            contexts <- readIORef cref
-            withContext' @(ContextTypes (Refs rs)) contexts $ do
+            (ContextsHolder cxt) <- readIORef cref
+            withContext' @(ContextTypes (Refs rs)) cxt $ do
                 runInBase $ h (RequestContext r ?cxt keys)
         ) >>= restoreM
 
@@ -283,6 +286,7 @@ instance ( WrapHandler (Server api) ks rs
          , cs ~ ContextTypes (Refs rs)
          , HasServer api context
          , HasContextEntry context (RequestContextEntry ks rs)
+         , SelectContexts (Refs cs) (Refs cs) (Refs cs)
          , ContextResources (Refs cs) (Refs rs)) => HasServer ((@>) (rs :: [*]) (ks :: [*]) :> api) context where
     type ServerT ((@>) rs ks :> api) m = RequestContext ks (R2C rs) -> ServerT api m
 
@@ -291,11 +295,19 @@ instance ( WrapHandler (Server api) ks rs
             genContext :: RoutingApplication -> RoutingApplication
             genContext a = \r f -> do
                 let (RequestContextEntry resources key) = getContextEntry context :: RequestContextEntry ks rs
-                withContext' @(ContextTypes (Refs rs)) resources $ do
-                    let rck@(RequestContextKeys ckey _) = fromJust $ V.lookup key (vault r)
-                    let cref = fromJust $ V.lookup ckey (vault r)
-                    writeIORef cref ?cxt
-                    liftIO $ a r f
+                let rck@(RequestContextKeys ckey _) = fromJust $ V.lookup key (vault r)
+                let cref = fromJust $ V.lookup ckey (vault r)
+
+                holder <- readIORef cref
+                case holder of
+                    NoContexts -> do
+                        withContext' @(ContextTypes (Refs rs)) resources $ do
+                            $(logQD' "Ext.Servant") ?cxt $ "Execute new context for coming request."
+                            writeIORef cref (ContextsHolder ?cxt)
+                            liftIO $ a r f
+                    ContextsHolder cxt -> do
+                        withContext' @(ContextTypes (Refs rs)) cxt $ do
+                            liftIO $ a r f
             serverD' c p h a b r = wrapHandler (Proxy :: Proxy rs) (Proxy :: Proxy ks) context r <$> serverD c p h a b r
             delayed' = Delayed { serverD = serverD'
                                , ..
@@ -388,7 +400,7 @@ instance {-# OVERLAPPABLE #-} (HandlerFilter f) => FilterHandler f (Handler a) w
         case V.lookup key (vault r) of
             Just rck@(RequestContextKeys ckey keys) -> do
                 let cref = fromJust $ V.lookup ckey (vault r)
-                cxt <- liftIO $ readIORef cref
+                (ContextsHolder cxt) <- liftIO $ readIORef cref
                 let ?cxt = selectContexts @(Refs (ContextsForFilter f)) cxt cxt
                 doFilter filter (RequestContext r ?cxt keys) h `catch` \(e :: ServantErr) -> throwError e
             Nothing -> fail "No resource context found in request"
